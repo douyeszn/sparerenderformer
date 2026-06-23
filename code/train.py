@@ -13,6 +13,7 @@ Note: Requires installing the renderformer package first:
 import sys
 from pathlib import Path
 import argparse
+import dataclasses
 import json
 import torch
 import torch.nn as nn
@@ -119,7 +120,11 @@ def train_epoch(model, dataloader, device, optimizer, epoch: int) -> float:
 
         try:
             output = model(tri_vpos, texture_patches, valid_mask, vns, rays_o, rays_d, tri_vpos_view)
-            target = torch.randn_like(output)
+            # Use real rendered images from HDF5 as training targets
+            images = batch['images'].to(device)  # (batch_size * hdf5_views, H, W, 3)
+            hdf5_views = images.shape[0] // batch_size
+            # Reshape to (batch_size, hdf5_views, H, W, 3) and take the first num_views
+            target = images.view(batch_size, hdf5_views, *images.shape[1:])[:, :num_views]
             loss = nn.functional.mse_loss(output, target)
 
             loss.backward()
@@ -194,7 +199,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': loss,
-                'config': config.__dict__,
+                'config': dataclasses.asdict(config),
             }, checkpoint_path)
             logger.info(f"Saved best checkpoint: {checkpoint_path}")
 
@@ -203,7 +208,7 @@ def main():
     torch.save({
         'epoch': args.num_epochs,
         'model_state_dict': model.state_dict(),
-        'config': config.__dict__,
+        'config': dataclasses.asdict(config),
         'losses': losses,
     }, final_path)
 
