@@ -1,0 +1,163 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{parskip}
+
+\title{The Transformer Encoder}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+The encoder's job is purely \textit{understanding}: it produces rich representations. Decoding (generation) is handled separately.
+
+\section{Overview}
+
+A transformer encoder maps an input sequence to a sequence of contextualized representations. Each token gets a vector that carries information about the other tokens around it.
+
+A transformer encoder is a stack of identical layers. Each layer has two sub-components:
+
+\begin{enumerate}
+    \item Multi-Head Self-Attention (with residual connection and layer norm)
+    \item Feed-Forward Network (with residual connection and layer norm)
+\end{enumerate}
+
+The output of each layer has the same shape as its input, so layers can be stacked freely.
+
+\section{Step by Step}
+
+\subsection{Input Embeddings and Positional Encoding}
+
+Tokens are converted to dense vectors. Since attention has no built-in notion of order, positional encodings are added to inject sequence position. These are typically sine/cosine functions or learned embeddings.
+
+\subsection{Multi-Head Self-Attention}
+
+For each token, the model asks: \textit{which other tokens should I attend to?}
+
+Each token produces three vectors:
+\begin{itemize}
+    \item \textbf{Q} (Query): what am I looking for?
+    \item \textbf{K} (Key): what do I offer?
+    \item \textbf{V} (Value): what information do I carry?
+\end{itemize}
+
+Attention scores are computed as:
+
+\begin{equation}
+    \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+\end{equation}
+
+The $\sqrt{d_k}$ scaling prevents the dot products from becoming too large as dimensionality grows. \textit{Multi-head} means this operation runs in parallel with different learned projections, and the results are concatenated. This lets the model attend to different aspects of the sequence simultaneously.
+
+\subsection{Residual Connection and Layer Normalization}
+
+The attention output is added back to the input (residual/skip connection) and then normalized. This stabilizes training and helps gradients flow through deep stacks.
+
+\subsection{Feed-Forward Network}
+
+A two-layer MLP applied independently to each position:
+
+\begin{equation}
+    \text{FFN}(x) = \text{ReLU}(xW_1 + b_1)\,W_2 + b_2
+\end{equation}
+
+This adds non-linearity and lets each token process what it gathered from attention. Another residual connection and layer norm follow.
+
+\section{Key Properties}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}l p{9cm}}
+\toprule
+Property & Meaning \\
+\midrule
+Parallelizable & All tokens are processed simultaneously, unlike RNNs \\
+Global context & Every token can attend to every other token in one step \\
+Permutation-invariant & Without positional encoding, order does not matter; the encoding fixes this \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Where Encoders Are Used}
+
+\begin{itemize}
+    \item \textbf{BERT}: encoder-only architecture, used for classification, named entity recognition, and question answering.
+    \item \textbf{Encoder-decoder models} (T5, original Transformer): the encoder reads the input; the decoder generates the output.
+\end{itemize}
+
+The encoder is responsible for understanding the input. It produces contextual representations that other components (decoders, classifiers, etc.) can build on.
+
+\section{Autoencoders vs.\ RenderFormer}
+
+Both autoencoders and RenderFormer have an encoder-like stage and a decoder-like stage, but the resemblance is superficial.
+
+\subsection{Autoencoder}
+
+An autoencoder is trained to reconstruct its own input. The target is the input itself, so no labels are needed (self-supervised). The defining feature is a \textit{bottleneck}: the latent vector $z$ has lower dimensionality than the input, forcing the encoder to learn a compact representation.
+
+\begin{equation}
+    x \;\xrightarrow{\text{Encoder}}\; z \;\xrightarrow{\text{Decoder}}\; \hat{x} \approx x
+\end{equation}
+
+Loss is computed between input and reconstruction:
+
+\begin{equation}
+    \mathcal{L} = \|x - \hat{x}\|^2 \quad \text{(MSE)} \qquad \text{or} \qquad
+    \mathcal{L} = -\sum \bigl[x \log \hat{x} + (1-x)\log(1-\hat{x})\bigr] \quad \text{(BCE)}
+\end{equation}
+
+\subsection{RenderFormer}
+
+RenderFormer is a feed-forward transformer pipeline. Input and output are different modalities: triangle mesh tokens in, HDR pixel patches out.
+
+\begin{equation}
+    \underbrace{\text{Triangle tokens } (N \times 13)}_{\text{scene}} \;\xrightarrow{\text{Self-attention (12 layers)}}\; \xrightarrow{\text{Cross-attention (6 layers)}}\; \xrightarrow{\text{Swin-L decoder}}\; \underbrace{\text{HDR image}}_{\text{render}}
+\end{equation}
+
+Training is supervised: loss is computed against Blender Cycles reference renders (L1 + LPIPS), not against the input. There is no bottleneck; triangle tokens preserve their dimensionality throughout the view-independent stage.
+
+\subsection{Comparison}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}l p{4.5cm} p{5cm}}
+\toprule
+ & Autoencoder & RenderFormer \\
+\midrule
+Goal & Reconstruct input & Render image from scene \\
+Input = Output? & Yes (same modality) & No (mesh tokens $\to$ pixels) \\
+Supervision & Self-supervised & Supervised (Cycles renders) \\
+Bottleneck & Yes, intentional & None \\
+Encoder purpose & Compress to latent $z$ & Propagate inter-surface illumination \\
+Decoder purpose & Expand $z$ back to input & Project illumination to camera \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The encoder/decoder terminology applies to both, but the bottleneck is what defines the autoencoder as a class. RenderFormer's two-stage structure exists because the rendering problem has two natural phases: resolve light transport (view-independent), then project to the camera (view-dependent).
+
+\section{Why the View-Independent Output Is Not a Latent $z$}
+
+After the 12 view-independent self-attention layers, the sequence of triangle tokens has the same length $N$ and the same dimensionality $D$ as the input. Nothing was compressed. What enters the view-dependent stage is therefore not a latent in the autoencoder sense.
+
+Each token has been \textit{contextualized}: it now carries information gathered from other triangles via attention. But the sequence is full-resolution and full-size throughout.
+
+\begin{center}
+\begin{tabular}{>{\bfseries}l p{4.5cm} p{4.5cm}}
+\toprule
+ & Autoencoder $z$ & RF view-indep.\ output \\
+\midrule
+Size vs.\ input & Smaller (bottleneck) & Same ($N \times D$) \\
+Information & Compressed summary & Full sequence, contextualized \\
+Purpose & Force learning by constraint & Pass enriched features forward \\
+Sampling possible? & Yes (in VAE) & No \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The view-dependent stage then performs cross-attention: ray-bundle tokens (queries) attend to the triangle tokens (keys and values). The ray bundles select what they need from the full triangle sequence. This is where projection to pixels happens, but it is not a bottleneck in the autoencoder sense. It is a change of modality, not a compression.
+
+\end{document}

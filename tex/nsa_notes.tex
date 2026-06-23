@@ -1,0 +1,359 @@
+% ============================================================
+%  Technical Notes: Native Sparse Attention (NSA)
+%  Reference: Yuan et al. (DeepSeek, 2025). arXiv:2502.11089
+%  Compile: tectonic nsa_notes.tex
+% ============================================================
+
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{top=1in, bottom=1in, left=1.25in, right=1.25in}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\emergencystretch=2em
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{mdframed}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black,
+            citecolor=green!50!black, urlcolor=blue!60!black}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\title{\textbf{Technical Notes: Native Sparse Attention (NSA)}}
+\author{Reference: Yuan et al.\ (DeepSeek, 2025)\\
+        \small\texttt{arXiv:2502.11089}}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\section{Problem Statement}
+% ============================================================
+
+Full self-attention scales quadratically with sequence length, making long-context pretraining
+computationally prohibitive. Prior sparse attention methods such as BigBird and Longformer
+address this through fixed, pre-defined patterns applied after full-attention pretraining. This
+post-hoc approach has two consequences. First, training still requires full attention, so
+computational savings apply only at inference. Second, because the model is not trained to be
+sparse, quality degrades when sparsity is applied. The theoretical speedups in prior methods do
+not translate to real hardware gains because the sparse patterns are not aligned with how modern
+GPUs load data.
+
+% ============================================================
+\section{Contribution}
+% ============================================================
+
+NSA (Native Sparse Attention) introduces natively trainable sparse attention in which sparsity
+is part of the model architecture from the start of pretraining. The method is designed around
+hardware constraints, specifically the memory-bandwidth bottleneck in long-sequence attention on
+GPUs. Speedups are demonstrated across all three phases: decoding, forward propagation, and
+backward propagation. The model is pretrained on 270 billion tokens at a context length of 64k
+tokens.
+
+% ============================================================
+\section{Inference Phases and the Prefilling Stage}
+% ============================================================
+
+Inference in autoregressive language models consists of two sequential stages: prefilling and
+decoding. Understanding their distinct computational profiles is necessary to evaluate where
+sparse attention yields the largest gains.
+
+\subsection{Prefilling}
+
+Prefilling is the initial phase in which the model processes the entire input prompt before
+generating any new tokens. The model reads all input tokens in parallel and builds the
+key-value (KV) cache that decoding will consume. This stage involves two forms of
+intensive pre-processing. The first is computing attention maps over the full input sequence,
+which has cost $O(n^2)$ in the sequence length $n$. The second is building any auxiliary
+indices required by sparse attention, such as block importance rankings for the selection
+branch or compressed block representations for the compression branch. Because all input tokens
+are available simultaneously, prefilling is compute-bound rather than memory-bandwidth-bound.
+For long prompts, it is therefore the phase where sparse attention reduces the most
+floating-point operations.
+
+\subsection{Autoregressive Decoding}
+
+Decoding generates tokens one at a time. At each step, the model attends over the KV cache
+accumulated from all prior tokens. Because only one new token is produced per step, the
+computation is bandwidth-bound: the bottleneck is loading the KV cache from high-bandwidth
+memory (HBM) rather than performing matrix multiplications. NSA reduces this bandwidth cost
+through GQA-consistent block selection, which loads each relevant KV block once per query group
+rather than once per query head (see Section~\ref{sec:gqa}).
+
+% ============================================================
+\section{Architecture}
+% ============================================================
+
+NSA decomposes attention into three parallel branches that are combined via learned scalar gates.
+
+\subsection{Block Parameters}
+
+Three hyperparameters govern the granularity of each branch. The compression block length $l$
+defines how many consecutive tokens are aggregated into a single compressed representation; the
+paper sets $l = 32$. The selection block length $l'$ defines the granularity of blocks that the
+selection branch retrieves as full, uncompressed tokens; this is set to $l' = 64$. The
+compression stride $d$ controls the spacing between adjacent compression blocks; this is set to
+$d = 16$, so compression blocks overlap by $l - d = 16$ tokens. Together, these values mean
+that the compression branch sees the sequence at a $32\times$ coarser resolution, while the
+selection branch operates on blocks twice as large as the compression blocks, which reduces
+index-building overhead during prefilling.
+
+\subsection{Compression Branch}
+
+The compression branch produces a coarse-grained representation of the full context. Contiguous
+token blocks of length $l = 32$ with stride $d = 16$ are each compressed into a single token
+using a learnable MLP with intra-block positional encoding. The model attends over these
+compressed block tokens, which reduces the number of keys per query by approximately $32\times$.
+The compressed representations also serve as the source of importance scores for the selection
+branch: after computing attention between a query and the compressed block tokens, the resulting
+attention weights indicate which regions of the sequence are most relevant to that query.
+
+\subsection{Selection Branch}
+
+The selection branch uses the attention scores from the compression branch as importance
+estimates. Specifically, for each query $q_t$, the model computes
+$\tilde{p}_{\text{slc}} = \mathrm{Softmax}(q_t^\top \tilde{K}_{\text{cmp}})$, then ranks
+selection blocks of length $l' = 64$ by their aggregated score and retrieves the top-$k$ blocks
+as full, uncompressed tokens. Selection is dynamic: each query retrieves different blocks
+depending on content, so the model learns which parts of the context are relevant rather than
+following a fixed pattern.
+
+\subsection{Sliding Window Branch}
+
+The sliding window branch attends to a fixed window of the $w$ most recent tokens. It handles
+local continuity independently of the other two branches, which prevents gradient interference
+between local and long-range learning signals.
+
+\subsection{Gating}
+
+The three branch outputs are combined as:
+\[
+  o_t \;=\; \sum_{c \,\in\, \{\text{cmp},\,\text{slc},\,\text{win}\}}
+            g_t^c \cdot \mathrm{Attn}\!\left(q_t,\,\tilde{K}_t^c,\,\tilde{V}_t^c\right)
+\]
+where $g_t^c \in [0,1]$ are gate scores produced by a per-branch MLP with sigmoid activation.
+The gates allow the model to weight branches differently depending on the query.
+
+% ============================================================
+\section{GQA Integration}
+\label{sec:gqa}
+% ============================================================
+
+NSA is designed for Grouped Query Attention (GQA), in which multiple query heads share a single
+KV head. Block selection in the selection branch is made consistent across all query heads within
+a GQA group by aggregating their importance scores before ranking:
+\[
+  \tilde{p}'_{\text{slc}} \;=\; \sum_{h} \tilde{p}_{\text{slc},(h)}
+\]
+This ensures the same KV blocks are loaded once per group rather than once per head, which
+reduces KV-cache bandwidth during decoding. GQA itself reduces the number of KV heads relative
+to query heads so that less memory is loaded per decoding step. NSA's group-consistent selection
+extends this bandwidth reduction to the selection branch.
+
+% ============================================================
+\section{Hardware Motivation and Arithmetic Intensity}
+\label{sec:hw}
+% ============================================================
+
+\subsection{Arithmetic Intensity}
+
+Arithmetic intensity is the ratio of floating-point operations (FLOPs) to memory accesses
+(bytes loaded/stored). It determines which resource is the bottleneck on a given GPU.
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Regime} & \textbf{Intensity vs.\ hardware threshold} & \textbf{Bottleneck} \\
+\midrule
+Compute-bound  & Intensity \emph{above} critical threshold & GPU FLOP throughput \\
+Memory-bound   & Intensity \emph{below} critical threshold & Memory bandwidth (HBM) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every GPU has a critical arithmetic intensity equal to its peak FLOP rate divided by its memory
+bandwidth. A workload above this threshold is compute-bound; below it, memory-bound.
+
+\subsection{Phase-Specific Intensity in Language Models}
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Phase} & \textbf{Intensity} & \textbf{Optimisation goal} \\
+\midrule
+Training (forward + backward) & High --- batched matmuls & Reduce total FLOPs \\
+Prefilling                    & High --- parallel sequence processing & Reduce total FLOPs \\
+Autoregressive decoding       & Low --- load entire KV cache per token & Reduce memory access \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Decoding is memory-bandwidth bound because tokens are generated one at a time, each requiring
+the full KV cache to be loaded from HBM to SRAM. No batching over the sequence dimension is
+possible, so there is little computation to amortise the memory cost.
+
+\subsection{How NSA Achieves Near-Optimal Arithmetic Intensity}
+
+Long-sequence attention is memory-bandwidth bound on modern GPUs. The time to load key-value
+tensors from HBM to on-chip SRAM exceeds the time spent on matrix multiplication. NSA reduces
+the volume of KV data loaded per query through three mechanisms.
+
+\begin{enumerate}[nosep]
+  \item \textbf{Compression branch.} Replaces $l = 32$ raw tokens with one compressed token,
+    reducing KV volume by $32\times$ for the global context pass.
+  \item \textbf{Selection branch.} Loads only the top-$k$ KV blocks ranked as relevant by the
+    query, skipping the rest of the cache entirely.
+  \item \textbf{GQA-consistent block selection.} Loads each selected block once per query group
+    rather than once per query head, eliminating redundant KV-cache transfers across heads.
+\end{enumerate}
+
+Together these keep arithmetic intensity near the hardware-optimal point across all phases:
+during training and prefilling (compute-bound), they reduce total FLOPs; during decoding
+(memory-bound), they reduce total HBM reads. The paper characterises this as
+``arithmetic intensity-balanced'' design.
+
+% ============================================================
+\section{Comparison to Prior Methods}
+% ============================================================
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Property} & \textbf{BigBird / Longformer} & \textbf{NSA} \\
+\midrule
+Sparse patterns     & Fixed, pre-defined             & Learned during pretraining \\
+Training mode       & Full attention pretraining required & Native sparse pretraining \\
+Speedup phases      & Inference only                 & Pretraining + inference \\
+Hardware alignment  & Not optimised                  & Explicitly hardware-aligned \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of NSA against prior sparse attention methods.}
+\end{table}
+
+\subsection{Phase-Restricted Sparsity in Older Methods}
+
+A key failure mode of prior work is applying sparsity in only one phase of the model lifecycle,
+leaving the other phases at full-attention cost.
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Method} & \textbf{Sparsity applied} & \textbf{Left unaddressed} \\
+\midrule
+H2O             & Decoding only          & Prefilling, training \\
+MInference      & Prefilling only        & Decoding, training \\
+Quest, ClusterKV & Inference only        & Training \\
+NSA             & Training + prefilling + decoding & Nothing \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This restriction matters for real workloads. Book summarisation is dominated by prefilling;
+long reasoning chains are dominated by decoding. A method that optimises only one phase fails
+to accelerate the other. NSA provides hardware-aligned sparse attention computation throughout
+the full model lifecycle, which is its central practical advantage over these methods.
+
+% ============================================================
+\section{Results}
+\label{sec:results}
+% ============================================================
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Benchmark} & \textbf{Full Attention} & \textbf{NSA} \\
+\midrule
+LongBench (64k avg)          & baseline & $+0.032$ \\
+Needle-in-Haystack (64k)     & ---      & Perfect retrieval \\
+AIME reasoning (16k)         & 0.092    & 0.146 \\
+\bottomrule
+\end{tabular}
+\caption{NSA versus full attention on long-context benchmarks.}
+\end{table}
+
+NSA matches or exceeds full attention on general benchmarks and outperforms it on long-context
+retrieval and reasoning tasks.
+Notably, NSA achieves \textbf{11$\times$ faster decoding} than full attention, the largest
+reported speedup for any phase. This gain is explained directly by the arithmetic intensity
+analysis in Section~\ref{sec:hw}: decoding is memory-bandwidth bound, and NSA's three-mechanism
+KV reduction (compression, selection, GQA-consistent loading) cuts HBM reads far more
+aggressively than any FLOPs reduction could at that phase.
+
+% ============================================================
+\section{Sparsity as a Functional Regularizer}
+% ============================================================
+
+Beyond efficiency, sparsity in NSA acts as a regularizer on the learning process.
+Two mechanisms explain this.
+
+\paragraph{Hierarchical focus.}
+The three-branch architecture forces the model to maintain two levels of awareness simultaneously:
+the compression branch provides a global, low-frequency scan of the full context, while the
+selection branch provides fine-grained access to specific important blocks.
+This prevents the model from being overwhelmed by the volume of long-context data.
+Without the coarse branch, the model has no global signal when the context is too long for
+any individual token to attend to the whole.
+Without the fine branch, the model loses precision on tokens that matter.
+The hierarchical structure enforces that both are always present.
+
+\paragraph{Suppression of irrelevant context.}
+By attending only to selected blocks, NSA prevents the model from incorporating irrelevant
+tokens into its representations.
+In standard attention over long sequences, weak but non-zero attention weights to distant,
+unrelated tokens act as low-level noise.
+Sparse selection eliminates this noise structurally rather than relying on the model to learn
+to suppress it.
+The result is that representations carry more signal from causally relevant tokens, which
+strengthens the model's ability to capture long-range logical dependencies and produces more
+robust reasoning over extended contexts.
+
+This regularization effect helps explain a counterintuitive result in the NSA paper: NSA
+\emph{outperforms} full attention on several long-context benchmarks (see Section~\ref{sec:results})
+rather than merely matching it.
+The sparse pattern is not a constraint degrading quality; it is a structural prior that
+improves it.
+
+% ============================================================
+\section{Relation to SparseRenderFormer}
+% ============================================================
+
+NSA's three-branch decomposition maps closely to the GP-Sparse module in SparseRenderFormer:
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{NSA Branch} & \textbf{GP-Sparse Equivalent} \\
+\midrule
+Compression   & Coarse branch (BVH-pooled block tokens) \\
+Selection     & Selected branch (top-$k$ BVH block selection) \\
+Sliding window & Local branch (kNN in 3D with normal-coherent mask) \\
+Learned gates & Per-head scalar gates (softmax-normalised $\lambda_1, \lambda_2, \lambda_3$) \\
+\bottomrule
+\end{tabularx}
+\caption{Correspondence between NSA branches and GP-Sparse in SparseRenderFormer.}
+\end{table}
+
+The primary distinction is that GP-Sparse replaces the position-agnostic sliding window with a
+geometry-aware local branch that uses 3D kNN and a normal-coherent mask (suppressing neighbours
+where $\mathbf{n}_i \cdot \mathbf{n}_j < -0.5$). This substitution is appropriate for
+triangle-mesh rendering, where spatial proximity and surface orientation are more informative
+locality signals than token recency.
+
+\end{document}

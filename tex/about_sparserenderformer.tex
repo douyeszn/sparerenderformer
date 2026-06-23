@@ -1,0 +1,995 @@
+% ============================================================
+%  About This Work: SparseRenderFormer
+%  RenderFormer Essentials, Main Contribution, Supporting Contribution
+%  Internal document. Compile: tectonic about_sparserenderformer.tex
+% ============================================================
+
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{top=1in, bottom=1in, left=1.25in, right=1.25in}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\emergencystretch=2em
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{mdframed}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black,
+            citecolor=green!50!black, urlcolor=blue!60!black}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\newcommand{\ours}{SparseRenderFormer}
+\newcommand{\RF}{RenderFormer}
+\newcommand{\step}[1]{\textbf{Step #1.}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\newmdenv[linecolor=blue!40, backgroundcolor=blue!5,
+          innerleftmargin=8pt, innerrightmargin=8pt,
+          innertopmargin=6pt, innerbottommargin=6pt]{claimbox}
+
+\newmdenv[linecolor=orange!60, backgroundcolor=orange!5,
+          innerleftmargin=8pt, innerrightmargin=8pt,
+          innertopmargin=6pt, innerbottommargin=6pt]{actionbox}
+
+% ============================================================
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries About This Work: \ours}\\[6pt]
+  {\large RenderFormer Essentials $\cdot$ Main Contribution $\cdot$ Supporting Contribution}\\[4pt]
+  {\normalsize Victor Miene \quad|\quad Carnegie Mellon University}\\[2pt]
+  {\small\color{gray}Internal document. Not for submission. \today}
+\end{center}
+
+\hrule
+\vspace{10pt}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section*{The Problem in Plain Terms}
+
+RenderFormer works by having every triangle in a 3D scene compare itself
+to every other triangle to compute how light bounces between them.
+That comparison grows quadratically: double the number of triangles and
+the work quadruples.
+At 4{,}096 triangles this already pushes the limit of a high-end GPU.
+Real 3D assets (rooms, characters, product models) routinely
+have 8{,}000 to 32{,}000 triangles or more.
+RenderFormer runs out of memory before it can render them.
+
+\ours fixes this by making the comparisons selective.
+Instead of every triangle looking at every other triangle, each triangle
+looks at three targeted groups: a compressed summary of the whole scene,
+a small set of surfaces that are physically likely to matter for its
+lighting, and its immediate spatial neighbours.
+The total number of comparisons drops from quadratic to roughly linear,
+which allows the method to scale to scenes that were previously too large
+to render with this approach.
+
+This change affects both inference and fine-tuning, but for the same
+underlying reason and with different intent.
+At inference, a 32{,}768-triangle scene simply does not fit in GPU memory
+under dense attention --- the method cannot run at all.
+GP-Sparse makes the forward pass fit, so rendering large scenes becomes
+possible.
+During fine-tuning the same forward pass is required, so GP-Sparse also
+makes training on large scenes tractable.
+The intent, however, is inference: cheaper fine-tuning is a side effect,
+not a goal.
+This distinguishes \ours from NSA, which explicitly targets both training
+speed and inference speed as separate objectives across different phases
+of an autoregressive model.
+
+% ============================================================
+\section{RenderFormer Essentials}
+
+\begin{mdframed}[linecolor=black!30, backgroundcolor=gray!5]
+\textbf{What this section covers.}
+The components of \RF that \ours directly modifies or depends on.
+Read this before the additions below.
+\end{mdframed}
+
+\subsection*{Must-Know Bullet Points}
+
+\begin{itemize}
+
+  \item \textbf{Triangle token (13 dimensions).}
+    Each triangle is represented as a 13-dimensional feature vector:
+    surface normal (3 dims), diffuse albedo (3), specular albedo (3),
+    roughness (1), and emission (3).
+    Geometric position is not concatenated; it is encoded via 3D~RoPE
+    (see next bullet).
+    The normal slice is \code{[:, 0:3]} in the token tensor.
+
+  \item \textbf{3D RoPE (not standard positional encoding).}
+    Standard positional encoding adds a position vector directly to the
+    token embedding before attention.
+    Position therefore becomes part of the token content, and the model
+    must learn to disentangle geometry from appearance.
+
+    RoPE (Rotary Position Encoding, Su et al.\ RoFormer) works differently.
+    It does not touch the token at all.
+    Instead, it rotates the query vector $\mathbf{q}_i$ and the key vector
+    $\mathbf{k}_j$ in the attention computation using their respective
+    positions, so that the dot product $\mathbf{q}_i \cdot \mathbf{k}_j$
+    automatically encodes the \emph{relative} position between tokens $i$
+    and $j$.
+    No position information is stored in the token; it enters only at the
+    moment two tokens are compared.
+
+    \RF extends this to three spatial dimensions.
+    Each triangle has three vertex positions
+    $\mathbf{v}^{(1)}, \mathbf{v}^{(2)}, \mathbf{v}^{(3)} \in \mathbb{R}^3$.
+    These are used to rotate $\mathbf{q}$ and $\mathbf{k}$ so that the
+    attention logit between triangles $i$ and $j$ reflects their relative
+    3D geometry.
+    The result is translation invariant by construction.
+    There are no learned positional embeddings.
+
+    In GP-Sparse, 3D RoPE is applied per branch:
+    the coarse branch uses the centroid of each BVH block as the position
+    for the compressed block token; the selected and local branches use
+    each triangle's own vertex positions.
+    This means geometric relationships are preserved at block resolution
+    in the coarse branch and at triangle resolution in the other two.
+
+  \item \textbf{View-independent stage (the bottleneck we fix).}
+    Twelve standard self-attention layers propagate triangle-to-triangle
+    light transport.
+    Complexity is $O(N^2)$ in time and memory.
+    At $N = 4{,}096$ this fits on one A100-80GB; at $N = 32{,}768$ it
+    requires $64\times$ more memory and is infeasible.
+    \ours replaces this stage with three-branch sparse attention.
+
+  \item \textbf{View-dependent stage.}
+    Six cross-attention layers map ray-bundle tokens to triangle features
+    to produce HDR pixel outputs.
+    Complexity is $O(R \cdot N)$ for $R$ ray bundles.
+    \ours reduces this to $O(R \cdot k_r)$ via frustum culling.
+
+  \item \textbf{Pixel decoder.}
+    A Swin-Large backbone converts ray-bundle features to HDR pixel
+    patches. \ours leaves this untouched.
+
+  \item \textbf{Training.}
+    205M parameters trained on 16M HDR Objaverse renders for 8 days on
+    8$\times$A100-80GB.
+    \ours fine-tunes from this checkpoint rather than retraining from
+    scratch; only the attention projection matrices in the view-independent
+    stage are re-initialised.
+
+    \textbf{Why fine-tuning is sufficient, and why we do not need heavy GPU.}
+    The 8-day run taught \RF everything from scratch: how materials look,
+    how light bounces, what geometry means.
+    That knowledge is distributed across the token embeddings, the
+    view-dependent cross-attention layers, and the Swin-L pixel decoder.
+    None of those weights change.
+    The only weights that change are the attention projections in the
+    view-independent stage, because those are the ones whose access
+    pattern changes from dense to sparse.
+    The model does not need to relearn physics or appearance; it only
+    needs to adapt to attending selectively rather than exhaustively.
+
+    The architectural change also makes large-scale fine-tuning tractable
+    in a second way.
+    Dense attention at $N = 32{,}768$ requires $64\times$ more memory than
+    at $N = 4{,}096$; a forward pass at that scale is infeasible with the
+    original \RF architecture.
+    GP-Sparse reduces the view-independent stage from $O(N^2)$ to
+    effectively $O(N)$, so scenes that were previously unrunnable now fit
+    in GPU memory.
+    The architectural change is therefore not a training cost but what
+    makes fine-tuning at target scale possible at all.
+
+    \textbf{The primary benefit is at inference, not training.}
+    The goal of GP-Sparse is to render scenes with far more triangles
+    than \RF can handle at all.
+    Training is affected only because GP-Sparse makes a forward pass at
+    large $N$ feasible; without it, fine-tuning on large scenes would
+    be impossible.
+    But cheaper or faster training is not the objective.
+    The objective is inference on scenes that were previously unrunnable.
+
+  \item \textbf{What we change: GP-Sparse (Geometry-Physics Sparse Attention).}
+    The view-independent self-attention is replaced with GP-Sparse,
+    a three-branch module whose block structure follows the scene BVH.
+    GP-Sparse is the main contribution of this paper.
+    The two physics-grounded additions described in Sections~\ref{sec:main}
+    and~\ref{sec:supporting} are specific modifications within GP-Sparse.
+    \begin{itemize}
+      \item \textbf{Coarse branch.} Each triangle attends to area-weighted
+        compressed summaries of \emph{parent-level} BVH blocks (one level
+        above the leaf nodes). Using the parent level produces tokens that
+        each cover at least $2\times$ more triangles than a leaf, giving
+        the branch a genuinely coarse receptive field. Captures low-frequency
+        radiance such as ambient light and large colour transfers.
+      \item \textbf{Selected branch.} Each triangle selects the top-$k$
+        \emph{leaf-level} BVH blocks using a lightweight block scorer:
+        \[
+          I_{i,\beta} = \sum_{j=1}^{H^I} w^I_{i,j}
+                        \cdot \mathrm{ReLU}\!\left(q^I_{i,j}
+                        \cdot \bar{k}^I_\beta\right),
+        \]
+        where $q^I_{i,j}$ derives from triangle $i$'s token,
+        $\bar{k}^I_\beta$ derives from the area-weighted pooled token of
+        block $\beta$, and $H^I$ is the number of scorer heads (e.g.\
+        $H^I = 4$). ReLU activation suppresses negative scores without
+        normalisation, which is hardware-efficient and sparse by
+        construction. In Stage~1 the scorer is calibrated via KL warm-up;
+        in Stage~2 the top-$k$ selection uses a straight-through estimator
+        (STE) so rendering-loss gradients reach the scorer and main model
+        jointly (see the training procedure below). Captures direct
+        illumination, one-bounce specular, and shadow casters.
+      \item \textbf{Local branch.} Each triangle attends to its 64
+        spatially nearest neighbours in 3D, with back-facing neighbours
+        suppressed. Captures contact shadows and near-field colour bleeding.
+    \end{itemize}
+    The outputs of all three branches are combined by per-head learned
+    gates $\lambda_1, \lambda_2, \lambda_3$.
+    Both contributions introduce zero new parameters.
+
+\end{itemize}
+
+% ------------------------------------------------------------
+\subsection*{Input Encoding: How a Scene Becomes Tokens}
+
+\textbf{Step 1: Each triangle becomes a 13-dimensional feature vector.}
+Surface attributes are packed in a fixed order; geometry is handled
+separately (see Step~2).
+
+\begin{center}\small
+\begin{tabular}{@{}llc@{}}
+\toprule
+Slice & Attribute & Dims \\
+\midrule
+\code{[:, 0:3]}   & Surface normal    & 3 \\
+\code{[:, 3:6]}   & Diffuse albedo    & 3 \\
+\code{[:, 6:9]}   & Specular albedo   & 3 \\
+\code{[:, 9]}     & Roughness         & 1 \\
+\code{[:, 10:13]} & Emission          & 3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Step 2: Geometric position enters via 3D RoPE, not the token.}
+Standard positional encoding adds a position vector to each token before
+attention, forcing the model to disentangle geometry from appearance.
+3D RoPE never touches the token.
+Instead, it rotates the query $\mathbf{q}_i$ and key $\mathbf{k}_j$ at
+attention time using each triangle's three vertex positions, so the dot
+product $\mathbf{q}_i \cdot \mathbf{k}_j$ encodes the relative 3D
+geometry between triangles $i$ and $j$ automatically.
+The result is translation-invariant by construction and requires no
+learned positional embeddings.
+
+In GP-Sparse, 3D RoPE is applied per branch:
+the coarse branch uses the centroid of each BVH block as the position for
+the compressed block token (block-resolution geometry); the selected and
+local branches use each triangle's own vertex positions (triangle-resolution
+geometry).
+
+\textbf{Step 3: Tokens flow through the two-stage pipeline.}
+
+\begin{center}\small
+\begin{tabular}{@{}cl@{}}
+\toprule
+Stage & Operation \\
+\midrule
+Input & Triangle tokens $(N \times 13)$ \\
+View-independent & 12$\times$ self-attention layers (3D RoPE on $\mathbf{q}$, $\mathbf{k}$) \\
+                 & \textit{Replaced by GP-Sparse in \ours} \\
+View-dependent   & 6$\times$ cross-attention: ray-bundle queries attend to triangle keys/values \\
+Pixel decoder    & Swin-Large $\to$ HDR pixel patches \\
+Output           & HDR image \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The 13-dimensional token format is preserved throughout the view-independent
+stage; nothing is compressed or re-encoded between layers.
+After the 12 self-attention layers, each token carries the same dimensions
+but is now contextualised: it has gathered information from other triangles
+via attention.
+The view-dependent stage then changes modality (mesh tokens to pixels) via
+cross-attention, not via a bottleneck.
+
+\subsection*{Block Scorer and Training Procedure}
+
+GP-Sparse uses a two-stage continued training procedure, adapted from DSA
+(DeepSeek-AI, 2025), to initialise the block scorer before sparse routing
+is imposed on a dense RenderFormer checkpoint.
+
+\textbf{Stage 1: Dense Warm-up.}
+All GP-Sparse parameters are frozen except the block scorer.
+Full dense attention runs normally.
+The scorer is trained with a KL divergence loss against the dense attention
+distribution:
+\begin{equation}
+  \mathcal{L}^I = \sum_i \mathbb{D}_{\mathrm{KL}}\!\left(
+    p_{i,:} \;\Big\|\; \mathrm{Softmax}(I_{i,:}) \right),
+  \label{eq:scorer_warm_up}
+\end{equation}
+where $p_{i,:}$ is the L1-normalised sum of the dense attention weights for
+triangle $i$ across all heads.
+This stage runs for a small number of steps and teaches the scorer to predict
+which BVH blocks the dense model finds important before any sparse routing is
+imposed.
+Without this warm-up, sparse routing starts from a random initialisation and
+the indirect gradient from the rendering loss is too weak to align the scorer
+reliably.
+
+\textbf{Stage 2: Sparse Fine-Tuning.}
+Sparse block selection and the normal-coherent mask are activated; all
+parameters are unfrozen.
+Both discrete operations use straight-through estimators (STE): the
+forward pass uses the hard top-$k$ selection and the hard normal mask;
+the backward pass passes gradients through the scorer logits and the
+sigmoid soft-mask respectively.
+This allows the rendering loss to flow end-to-end into both the scorer
+and the triangle normal representations.
+The auxiliary $\mathcal{L}^I$ continues as a calibration signal, weighted
+by $\alpha = 0.01$:
+$\mathcal{L} = \mathcal{L}^{\text{render}} + \alpha\,\mathcal{L}^I$.
+
+\subsection*{Where GP-Sparse Comes From}
+
+GP-Sparse is adapted from \textbf{NSA (Native Sparse Attention)},
+introduced by Yuan et al.\ (arXiv:2502.11089) for language modelling.
+NSA decomposes attention into three hardware-aligned branches:
+compressed token blocks, dynamically selected fine blocks, and a local
+sliding window.
+It achieves near-lossless perplexity at $O(N)$ cost on sequences of up
+to 64k tokens.
+
+GP-Sparse takes the three-branch structure of NSA and replaces every
+language-specific component with a rendering-equation-grounded equivalent:
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+NSA & GP-Sparse \\
+\midrule
+Sequential block boundaries     & BVH leaf node boundaries \\
+Uniform pooling                 & Area-weighted pooling (rendering integral) \\
+1D causal RoPE                  & 3D RoPE on triangle vertex positions \\
+Local sliding window            & $k$-NN in 3D space \\
+No neighbourhood mask           & Normal-coherent mask (hemisphere constraint) \\
+\midrule
+Single block depth for all branches
+  & Parent level (coarse branch) $+$ leaf level (selected branch) \\
+Compressed attn as routing signal
+  & Dedicated block scorer, KL warm-up, STE end-to-end gradient \\
+Overlapping stride ($d < l$)
+  & Boundary fringe ($k_{\text{fringe}}$ triangles from neighbouring leaves) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+NSA and all prior sparse attention methods operate on one-dimensional
+token sequences with no spatial geometry.
+Their neighbourhood masks carry no physical meaning.
+GP-Sparse is the first method to apply a geometric visibility primitive
+(back-face culling) as a hard attention mask, which is precisely what
+Addition~1 (Section~\ref{sec:main}) contributes.
+Addition~2 (Section~\ref{sec:supporting}) grounds the coarse branch
+pooling step in the rendering integral, which NSA does not do.
+
+% ============================================================
+\section*{Things to Note When Reading the Literature}
+
+\begin{mdframed}[linecolor=black!30, backgroundcolor=gray!5]
+Reading comprehension notes for the key papers in this area.
+What to look for and how each paper relates to this work.
+\end{mdframed}
+
+\paragraph{NSA (Yuan et al., arXiv:2502.11089).}
+This is the direct structural source of GP-Sparse.
+When reading it, note that the three-branch split (compressed blocks,
+selected blocks, local window) is the core idea, and that every branch
+is designed around one-dimensional token sequences with fixed sequential
+block boundaries.
+There is no notion of geometry, physical plausibility, or neighbourhood
+semantics.
+The local window is simply a fixed sliding window over token indices.
+Understanding this gap is essential: GP-Sparse replaces every
+sequence-specific component with a geometry- or physics-grounded
+equivalent.
+
+\paragraph{RenderFormer (Zeng et al., SIGGRAPH 2025).}
+This is the base model.
+When reading it, pay close attention to: (1) the triangle token format
+and what each dimension encodes; (2) how 3D RoPE encodes position in
+the attention logits rather than the token; (3) the separation between
+the view-independent and view-dependent stages and why that separation
+matters for reuse across viewpoints; (4) the training data pipeline
+from Objaverse.
+Everything in GP-Sparse either modifies or depends on one of these four
+components.
+
+\paragraph{The rendering equation (Kajiya, 1986).}
+This paper defines the physical law that both additions are grounded in.
+Note the hemisphere integral: radiance arriving at a surface point
+integrates only over directions in the upper hemisphere
+($\mathbf{n} \cdot \omega > 0$).
+This is the physical justification for the normal-coherent mask
+($\tau = 0.5$).
+Also note that the integral weights a surface patch by its projected
+area ($\cos\theta \, dA$), which is the justification for area-weighted
+pooling in the coarse branch.
+
+\paragraph{FlashAttention (Dao et al., 2022, 2023).}
+When reading this, note that FlashAttention reduces memory \emph{I/O}
+by tiling the softmax computation in SRAM.
+It does not reduce the number of attention pairs computed; complexity
+remains $O(N^2)$.
+GP-Sparse and FlashAttention address different problems: GP-Sparse
+reduces which pairs are computed; FlashAttention makes computing a
+given set of pairs more memory-efficient.
+The two are complementary.
+
+\paragraph{BigBird, Longformer, Reformer.}
+These are earlier sparse attention methods.
+When reading them, note that sparsity is defined by sequence position
+(local windows, global tokens, random hashing).
+None use geometry to define neighbourhoods and none operate on 3D
+structure.
+They are worth knowing for context but NSA is the relevant comparison
+for GP-Sparse because NSA is also hardware-aligned and multi-branch.
+
+\paragraph{NeRF, 3DGS, DiffusionRenderer.}
+When reading these, note what they do \emph{not} do: none model
+explicit inter-surface light transport.
+NeRF and 3DGS encode appearance implicitly and bake in the lighting
+at training time; changing a light source requires retraining or
+re-optimising.
+DiffusionRenderer uses G-buffers from a rasteriser and cannot operate
+on arbitrary mesh geometry directly.
+\RF is different because it propagates light between explicit triangle
+tokens, enabling relighting without per-scene baking.
+Keep this distinction clear when reading any neural rendering paper.
+
+\paragraph{EquiformerV2 and SE(3)-equivariant networks.}
+When reading these, note what equivariance gives you: a model that
+produces geometrically consistent outputs regardless of how the scene
+is rotated in 3D.
+\RF and \ours do not have this property.
+3D~RoPE gives translation invariance but not rotation invariance;
+\RF compensates with rotation augmentation during training.
+This is a known limitation of the current design, not an oversight.
+
+\paragraph{BVH literature (surface area heuristic, SAH).}
+The coarse branch and selected branch both rely on BVH structure.
+When reading BVH papers, note how SAH splitting works: it minimises
+expected ray-intersection cost by splitting where the product of
+surface area and primitive count is minimised.
+A side effect is that SAH tends to produce leaves of similar-sized
+triangles, which means area weights within a leaf may be nearly
+uniform on well-processed meshes.
+This is one of the listed disadvantages of Addition~2.
+
+% ============================================================
+\section*{NSA: Foundations This Work Builds On}
+
+GP-Sparse is structurally derived from NSA.
+Understanding what NSA is built on helps clarify what GP-Sparse inherits
+and what it replaces.
+
+\subsection*{1. Architectural Foundations}
+
+NSA is built on the standard Transformer and its vanilla attention
+mechanism.
+Three modern architectural choices shape the design:
+
+\begin{itemize}[nosep]
+  \item \textbf{Grouped-Query Attention (GQA) and Multi-Query Attention
+    (MQA).} NSA is designed to be compatible with these architectures,
+    which share KV-caches across multiple query heads to reduce memory
+    bandwidth.
+    GP-Sparse does not use GQA (each triangle token has its own head),
+    so this compatibility constraint does not carry over.
+  \item \textbf{Mixture-of-Experts (MoE).} NSA experiments use a backbone
+    combining GQA with DeepSeekMoE, totalling 27B parameters with only
+    3B active per token.
+    GP-Sparse uses the standard \RF attention projections without any
+    expert routing.
+  \item \textbf{YaRN.} NSA uses YaRN to extend context from 8k to 32k
+    tokens during fine-tuning.
+    GP-Sparse handles long context differently: the BVH partitions the
+    sequence geometrically so attention cost grows linearly with $N$
+    from the start, without any context-extension fine-tuning.
+\end{itemize}
+
+\subsection*{2. Hardware and Implementation Foundations}
+
+The ``native'' and ``hardware-aligned'' aspects of NSA rest on two
+implementation decisions:
+
+\begin{itemize}[nosep]
+  \item \textbf{FlashAttention principles.} NSA adopts blockwise memory
+    access and contiguous computation, maximising Tensor Core utilisation.
+    GP-Sparse inherits this: BVH leaf blocks map directly to contiguous
+    memory, making blockwise kernels applicable to the selected branch.
+    The local branch (kNN) is less contiguous and is the main
+    implementation risk.
+  \item \textbf{Triton kernels.} NSA implements its sparse attention
+    in Triton for tiled computation.
+    GP-Sparse can port the NSA Triton kernel (available in the
+    DeepSeek-V3 repo) with minimal changes; the block boundaries change
+    from sequential strides to BVH leaf offsets.
+\end{itemize}
+
+\subsection*{3. Conceptual and Empirical Inspirations}
+
+Three observations drove NSA's design choices:
+
+\begin{itemize}[nosep]
+  \item \textbf{Inherent sparsity.} Softmax attention is naturally sparse:
+    only a small subset of query-key pairs contributes significantly to
+    the output.
+    GP-Sparse exploits the same property but uses geometry (BVH
+    containment, surface normal alignment) to \emph{predict} which pairs
+    matter, rather than learning it purely from data.
+  \item \textbf{Blockwise clustering pattern.} Attention maps from a
+    pretrained full-attention model show that nearby keys share similar
+    importance scores.
+    This directly justifies blockwise selection over token-granular
+    selection: contiguous blocks are hardware-efficient and recover the
+    same important regions.
+    GP-Sparse grounds this observation in physics: triangles within the
+    same BVH leaf share a local light-transport context, which is a
+    geometry-based explanation for why block selection works in the
+    rendering domain.
+  \item \textbf{Critique of post-hoc methods.} NSA identifies that H2O,
+    MInference, Quest, and ClusterKV fail because they apply sparsity
+    only at inference time or use non-differentiable operations that
+    prevent the model from learning optimal sparse patterns.
+    GP-Sparse addresses both issues: the two-stage training procedure
+    (Section~\ref{sec:main}) trains with sparsity from the start, and the
+    straight-through estimators on the top-$k$ selection and normal mask
+    maintain full differentiability throughout fine-tuning.
+\end{itemize}
+
+In summary, NSA evolves the Transformer by integrating algorithmic
+sparsity with hardware-centric implementation for long-context
+training and inference.
+GP-Sparse inherits the three-branch structure and blockwise kernel design,
+and replaces every sequence-specific component with a rendering-equation
+equivalent.
+
+\subsection*{4. Optimization Goals: NSA vs.\ \ours}
+
+NSA targets two distinct bottlenecks depending on phase, because it
+operates on an autoregressive language model:
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Phase} & \textbf{Bottleneck} & \textbf{NSA's goal} \\
+\midrule
+Training (forward $+$ backward) & GPU FLOP throughput (compute-bound) & Reduce total FLOPs \\
+Prefilling                       & GPU FLOP throughput (compute-bound) & Reduce total FLOPs \\
+Autoregressive decoding          & HBM memory bandwidth (bandwidth-bound) & Reduce KV-cache reads \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The decode phase is bandwidth-bound for a specific reason: tokens are
+generated one at a time, and each new token must load the entire KV cache
+from HBM to SRAM to attend over all prior tokens.
+There is no computation to amortise that load, so the bottleneck shifts
+from FLOPs to memory reads.
+NSA's three mechanisms (32$\times$ compression, top-$k$ block selection,
+GQA-consistent loading) each reduce the volume of KV data read per step,
+which is why NSA achieves 11$\times$ faster decoding.
+
+\ours has neither of these bottlenecks.
+\RF is not an autoregressive model.
+It renders a full image in one forward pass: all $N$ triangle tokens are
+processed simultaneously.
+There is no sequential token generation, no KV cache, and no decode phase
+in the language-model sense.
+
+The bottleneck for \ours is simply $O(N^2)$ attention:
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{$N$ (triangles)} & \textbf{Attention pairs} & \textbf{Status} \\
+\midrule
+4{,}096  & $\sim$16M  & Feasible \\
+8{,}192  & $\sim$67M  & Memory-tight \\
+32{,}768 & $\sim$1B   & OOM --- infeasible \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At 32k triangles the dense attention matrix does not fit in GPU memory.
+This is not a latency or throughput problem; it is a \emph{feasibility}
+problem.
+Dense attention cannot run at that scale at all.
+
+The optimization goal of \ours is therefore distinct from both of NSA's
+goals: reduce $O(N^2) \to O(N \cdot k)$ to make large-$N$ rendering
+\emph{possible}, where $k$ is the number of tokens each query actually
+attends to across the three branches.
+The primary constraint is peak GPU memory; compute reduction is a
+byproduct, not the target.
+The metric that validates success is not latency at a fixed $N$ but
+whether the model can run at $N = 32{,}768$ and whether PSNR at that
+scale is competitive with a dense baseline evaluated at smaller $N$.
+
+% ============================================================
+\section{GP-Sparse Addition 1: Normal-Coherent Local Masking}
+\label{sec:main}
+
+\begin{mdframed}[linecolor=black!30, backgroundcolor=gray!5]
+\textbf{Status.} In \texttt{main.tex}.
+File to touch: \code{sparse\_attention.py} only.
+Zero new parameters.
+\end{mdframed}
+
+\subsection{Problem}
+
+The local branch wastes attention capacity on back-facing neighbours
+and degrades shadow boundary quality near silhouette edges.
+The branch selects the $k_\ell = 64$ spatially nearest triangles by
+Euclidean distance, but on a typical mesh 30--40\% of these neighbours
+face away from the query.
+Under the rendering equation, a triangle whose normal lies in the lower
+hemisphere of the query contributes zero radiance because the cosine
+factor $(\mathbf{n}_i \cdot \omega)^+$ clamps at zero.
+
+\subsection{Masking Rule}
+
+Suppress any neighbour $j$ whose normal forms more than a $120^\circ$
+angle with the query normal.
+The mask is defined by a hard indicator at inference and a sigmoid
+soft approximation for STE gradient flow during training:
+\begin{align}
+  \tilde{m}_{ij} &= \sigma\!\bigl(-s\,(\mathbf{n}_i \cdot \mathbf{n}_j + \tau)\bigr),
+  \label{eq:ncmask_soft_a2} \\
+  m_{ij}         &= \mathbf{1}[\mathbf{n}_i \cdot \mathbf{n}_j < -\tau],
+  \label{eq:ncmask_hard_a2}
+\end{align}
+where $\tau = 0.5$ and sharpness $s = 20$.
+The forward pass uses $m_{ij}$ (hard, physically exact); the backward
+pass propagates gradients through $\tilde{m}_{ij}$, so surface normals
+receive gradient signal from the rendering loss (straight-through
+estimator, Bengio et al.\ 2013).
+Subtracting $\mathbf{m}_i^{\text{STE}} \cdot \infty$ from the attention
+logits before softmax sets masked weights to zero.
+If all neighbours of a query are masked (concave corner), unmask all
+of them to prevent \code{softmax([-inf,\ldots,-inf])} returning NaN.
+
+\textbf{Why $\tau$ is fixed.}
+$\tau = 0.5$ is the hemisphere constraint of the rendering equation,
+not a learned preference.
+Allowing the optimiser to lower $\tau$ below zero would permit attention
+to back-facing triangles, which violates the physics.
+
+\begin{claimbox}
+\textbf{Novelty.} This is back-face culling applied as an attention mask.
+No prior sparse attention method applies a geometric visibility primitive
+inside the attention pattern because none operates on triangle meshes.
+The mask reduces effective neighbourhood size by 30--40\% at zero
+inference overhead.
+\end{claimbox}
+
+\subsection{Inspiration}
+
+\textbf{Back-face culling} is a standard technique in classical rasterisation
+pipelines.
+Any triangle whose surface normal faces away from the camera is discarded
+before drawing because it contributes nothing to the visible image.
+The normal-coherent mask applies the same physical reasoning inside the
+attention pattern: a triangle whose normal lies in the lower hemisphere of
+the query cannot exchange direct radiance with it, because the cosine term
+$(\mathbf{n}_i \cdot \omega)^+$ in the rendering equation clamps to zero
+for those directions.
+
+The three-branch structure of GP-Sparse is structurally inspired by NSA
+(Native Sparse Attention, Yuan et al., arXiv:2502.11089), which decomposes
+attention into compressed-block, selected-block, and local-window branches.
+NSA operates on one-dimensional token sequences with no geometric structure.
+In GP-Sparse, block boundaries follow the scene BVH rather than sequence
+order, pooling weights follow the rendering integral rather than uniform
+averaging, and the local branch applies the hemisphere constraint as a hard
+mask.
+The normal-coherent mask has no counterpart in NSA.
+
+\subsection{Disadvantages}
+
+\begin{itemize}[nosep]
+  \item \textbf{Translucent and subsurface-scattering materials.}
+    These surfaces genuinely receive light from behind the hemisphere.
+    The mask suppresses those interactions incorrectly, so the method
+    degrades on wax, skin, leaves, and other translucent geometry.
+  \item \textbf{Depends on correct surface normals.}
+    Noisy, inconsistent, or flipped normals in raw mesh data break the
+    mask silently: valid neighbours get suppressed and invalid ones are
+    kept, with no error signal.
+  \item \textbf{Fallback negates the benefit on concave geometry.}
+    When all neighbours of a query are masked (tight corners, interior
+    cavities), the guard unmasks all of them and the query reverts to
+    full local attention. The most geometrically complex triangles
+    receive no benefit.
+  \item \textbf{Diffuse hemisphere only.}
+    $\tau = 0.5$ encodes the diffuse hemisphere. For specular surfaces
+    the relevant window is a narrow reflection lobe, not the full
+    hemisphere, so the threshold is too coarse to mask correctly.
+\end{itemize}
+
+\subsection{Implementation (Key Steps)}
+
+\begin{enumerate}[nosep]
+  \item Locate the normal slice in the token tensor.
+    Set \code{NORMAL\_SLICE = slice(0, 3)} and verify
+    \code{n.norm(dim=-1).mean()}~$\approx 1.0$.
+  \item Compute cosine of shape $(N, k_\ell)$:\\
+    \code{cos\_nn = (n\_q[:, None] * n\_nbrs).sum(-1)}
+  \item Build hard mask (forward / inference):\\
+    \code{mask\_hard = cos\_nn < -tau}
+  \item Build soft mask (backward only, STE):\\
+    \code{mask\_soft = torch.sigmoid(-s * (cos\_nn + tau))}\\
+    \code{mask\_ste = mask\_soft + (mask\_hard.float() - mask\_soft).detach()}
+  \item Add all-masked guard:\\
+    \code{mask\_hard = mask\_hard \& \textasciitilde mask\_hard.all(dim=-1, keepdim=True)}.
+  \item Apply STE mask: \code{logits.masked\_fill(mask\_hard, float('-inf'))}.\\
+    (STE: replace \code{mask\_hard} with \code{mask\_ste} when gradients are needed.)
+\end{enumerate}
+
+\begin{actionbox}
+\textbf{Sanity check.}
+On the Cornell box, the floor (normal $+y$) and ceiling (normal $-y$)
+have dot product $-1 < -0.5$.
+The ceiling should be masked when the floor is the query.
+\end{actionbox}
+
+\subsection{Ablation Plan}
+
+Run at $N = 16{,}384$ on the Objaverse held-out split.
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Condition & Purpose \\
+\midrule
+\ours, no mask ($\tau = \infty$) & Baseline for this addition \\
+\ours, $\tau = 0.5$ & Main result \\
+$\tau \in \{0.0,\,0.5,\,0.9\}$ sweep & Inference-only; no retraining \\
+Sparsity measurement (\% masked) & Report in paper; expected 25--45\% \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% ============================================================
+\section{GP-Sparse Addition 2: Area-Weighted Coarse Pooling}
+\label{sec:supporting}
+
+\begin{mdframed}[linecolor=black!30, backgroundcolor=gray!5]
+\textbf{Status.} To be implemented.
+Files to touch: \code{bvh.py} (precompute areas) and
+\code{sparse\_attention.py} (replace \code{.mean(0)} with weighted sum).
+Zero new parameters.
+\end{mdframed}
+
+\subsection{Problem}
+
+Uniform average pooling dilutes bright emitters in leaves where they
+sit alongside many dark triangles, misrepresenting the radiometric
+content of the block.
+The coarse branch compresses each BVH leaf node into a single token
+by averaging all triangle tokens with equal weight.
+Under the rendering equation, however, a surface patch's contribution
+scales with its area: a large emitter and a small occluder are not
+equal contributors, so equal weighting is physically incorrect.
+
+\subsection{Fix: Area-Weighted Pooling}
+
+Replace uniform averaging with an area-weighted sum:
+\begin{equation}
+  \hat{\mathbf{K}}_\beta
+    = \frac{\sum_{j \in \mathcal{B}_\beta} A_j\,\mathbf{K}_j}
+           {\sum_{j \in \mathcal{B}_\beta} A_j},
+  \qquad
+  \hat{\mathbf{V}}_\beta
+    = \frac{\sum_{j \in \mathcal{B}_\beta} A_j\,\mathbf{V}_j}
+           {\sum_{j \in \mathcal{B}_\beta} A_j},
+  \label{eq:area_pool}
+\end{equation}
+where $A_j = \tfrac{1}{2}\|(v_1^j - v_0^j)\times(v_2^j - v_0^j)\|$
+is the area of triangle $j$.
+
+Area weighting is the leading-order approximation to solid angle:
+for compact BVH leaves where triangles are spatially close and similarly
+oriented, $A_j / r^2$ (the solid angle contribution) reduces to $A_j$
+up to a shared scale factor.
+The weights are query-independent, computed once per BVH build, and
+add no parameters.
+
+\textbf{Boundary fringe.}
+Standard area-weighted pooling assigns each triangle to exactly one leaf.
+A triangle at the boundary between two leaves therefore contributes nothing
+to the neighbouring leaf's pooled token.
+If that triangle is an emitter, the block scorer will fail to assign high
+importance to the neighbouring leaf, and the selected branch will not
+retrieve it.
+To close this gap, the $k_{\text{fringe}} = 4$ triangles from neighbouring
+leaves that are geometrically closest to each leaf's boundary triangles are
+included in the area-weighted pooling with their true areas.
+Fringe membership is determined at BVH build time and adds no per-forward-pass
+overhead.
+The fringe size of 4 is a conservative choice; ablation over
+$k_{\text{fringe}} \in \{0, 2, 4, 8\}$ should be included in the
+experimental section.
+
+\begin{claimbox}
+\textbf{Novelty.} With both additions in place, the coarse and local
+branches are grounded in the rendering equation: the coarse branch uses
+area weighting consistent with the rendering integral, and the local
+branch applies the hemisphere constraint as a hard mask
+(Section~\ref{sec:main}).
+To our knowledge, no prior sparse attention method applies
+physics-based weighting to its pooling step.
+\end{claimbox}
+
+\subsection{Implementation}
+
+\step{1} In \code{bvh.py}, precompute areas at BVH build time:
+\begin{verbatim}
+e1 = verts[:, 1] - verts[:, 0]        # (N, 3)
+e2 = verts[:, 2] - verts[:, 0]
+areas = 0.5 * torch.cross(e1, e2, dim=-1).norm(dim=-1)  # (N,)
+\end{verbatim}
+
+\step{2} In the coarse pooling loop, replace \code{.mean(0)} with:
+\begin{verbatim}
+w = areas[block_idx]                   # (b,)
+k_hat = (tokens[block_idx] * w[:, None]).sum(0) / w.sum()
+\end{verbatim}
+
+\step{3} Sanity check: set all non-emitter emission features to zero
+in a leaf that contains one large emitter.
+The pooled token's emission component should match the emitter's value
+weighted by its area fraction.
+
+\subsection{Ablation Plan}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Condition & Purpose \\
+\midrule
+\ours with uniform pooling & Baseline for this addition \\
+\ours with area-weighted pooling & Main result \\
+PSNR on emitter-heavy scenes vs.\ general scenes & Tests the hypothesis \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Disadvantages}
+
+\begin{itemize}[nosep]
+  \item \textbf{Weights are query-independent.}
+    Area weight is the same for all queries attending to a block.
+    A large triangle far from the query still receives high weight even
+    though it subtends a small solid angle from that distance.
+    The approximation holds for compact leaves but degrades when queries
+    are spread far from the block.
+  \item \textbf{Minimal benefit when SAH produces homogeneous leaves.}
+    Surface area heuristic splitting tends to group triangles of similar
+    size into the same leaf. When leaf triangles are all similarly sized,
+    area weights are nearly uniform and the weighted sum reduces to an
+    ordinary average.
+  \item \textbf{Does not help fragmented emitters.}
+    If a large light source spans multiple BVH leaves, its signal is
+    split across multiple pooled tokens regardless of weighting within
+    each leaf. Area weighting within a leaf cannot recover a signal that
+    is distributed across leaves.
+\end{itemize}
+
+% ============================================================
+\section*{Combined Checklist}
+
+\begin{itemize}[nosep]
+  \item[$\square$] Main: implement mask and verify on Cornell box
+  \item[$\square$] Main: measure sparsity on 100 held-out scenes
+  \item[$\square$] Main: run $\tau$ sweep at inference time on trained checkpoint
+  \item[$\square$] Supporting: precompute triangle areas in \code{bvh.py}
+  \item[$\square$] Supporting: replace \code{.mean()} with area-weighted pooling
+  \item[$\square$] Supporting: sanity check on emitter-heavy leaf node
+  \item[$\square$] Supporting: ablation on emitter-heavy vs.\ general split
+  \item[$\square$] Update contributions and coarse-branch equation in \texttt{main.tex}
+\end{itemize}
+
+\vspace{10pt}
+\hrule
+{\small\color{gray} Internal document. Do not distribute.}
+
+% ============================================================
+\newpage
+\section*{GPU Requirements}
+
+\subsection*{Short answer}
+
+No, this work does not require heavy GPU resources.
+A single A100-80\,GB (or A6000-48\,GB for ablations) is sufficient.
+
+\subsection*{Why fine-tuning is enough}
+
+The original \RF needed 8$\times$A100s for 8 days to train from scratch on
+16M Objaverse renders.
+This project does not do that.
+Fine-tuning starts from the released checkpoint and re-initialises only
+the attention projection matrices in the view-independent stage (roughly
+10--15\% of the 205M parameters).
+Everything else --- the Swin-L pixel decoder, the view-dependent stage,
+the token embeddings --- stays frozen.
+
+\subsection*{Why GP-Sparse makes single-GPU fine-tuning possible}
+
+Dense attention at $N = 32{,}768$ would require approximately $64\times$
+more memory than at $N = 4{,}096$, making even a single forward pass
+infeasible on a multi-GPU cluster.
+GP-Sparse reduces the view-independent stage from $O(N^2)$ to effectively
+$O(N)$, which is what makes fine-tuning at the target scale tractable on
+one GPU in the first place.
+
+\subsection*{Estimated requirements by task}
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Task} & \textbf{GPU} & \textbf{Approx.\ time} \\
+\midrule
+Stage~1 warm-up (scorer KL, frozen weights) & 1$\times$A100-80\,GB & Hours \\
+Stage~2 sparse fine-tuning ($N = 16$k scenes) & 1$\times$A100-80\,GB & Days, not weeks \\
+Inference / evaluation at $N = 32$k & 1$\times$A100-80\,GB & Seconds per scene \\
+Ablations at $N = 16$k & 1$\times$A6000-48\,GB & Workable \\
+Blender Cycles dataset renders & CPU or any GPU & Overnight batches \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{The real bottleneck is data, not training}
+
+Generating 1{,}000 scenes at $N = 16$k with Blender Cycles at 512\,spp
+takes overnight GPU time.
+The action steps document flags this explicitly: start rendering in Week~2,
+not after implementation finishes.
+Training time is not the constraint; waiting for data is.
+
+\subsection*{How to get free compute}
+
+Apply to all three sources immediately --- approval takes one to two weeks:
+
+\begin{itemize}[nosep]
+  \item AWS Research Credits ---
+    \url{https://aws.amazon.com/research-credits}
+  \item Google TPU Research Cloud ---
+    \url{https://sites.research.google/trc}
+  \item Microsoft Accelerate Foundation Models Research (AFMR) ---
+    {\small\url{https://www.microsoft.com/en-us/research/collaboration/accelerate-foundation-models-research}}
+\end{itemize}
+
+\vspace{10pt}
+\hrule
+{\small\color{gray} Internal document. Do not distribute.}
+
+\end{document}

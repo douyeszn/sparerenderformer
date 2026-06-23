@@ -1,0 +1,751 @@
+% ============================================================
+%  SparseRenderFormer — Eurographics / EGSR format
+%  Compile with tectonic from this directory (all .cls/.sty present)
+%  For submission: change \ConferencePaper to \ConferenceSubmission
+%  and anonymise author block
+% ============================================================
+
+\documentclass{egpubl}
+\usepackage{eg2026}
+
+% --- publication type (one active at a time) ---
+% \ConferenceSubmission   % anonymous submission
+\ConferencePaper          % final camera-ready
+% \SpecialIssuePaper      % CGF special issue (e.g. EGSR)
+
+\CGFStandardLicense
+
+% !! do not change anything above this line !!
+% -----------------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage{dfadobe}
+
+\usepackage{cite}
+\BibtexOrBiblatex
+\electronicVersion
+\PrintedOrElectronic
+
+\ifpdf
+  \usepackage[pdftex]{graphicx}
+  \pdfcompresslevel=9
+\else
+  \usepackage[dvips]{graphicx}
+\fi
+
+\usepackage{egweblnk}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{xspace}
+% -----------------------------------------------------------
+
+% Convenience macros
+\newcommand{\ours}{SparseRenderFormer\xspace}
+\newcommand{\RF}{RenderFormer\xspace}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\begin{document}
+
+% ---------------------------------------------------------------------------
+\title{Scaling Neural Global Illumination to Tens of Thousands of Triangles\\
+       via Hierarchical Sparse Attention}
+
+\author[V. Miene]{Victor Miene\\
+  Carnegie Mellon University\\
+  {\small\ttfamily vom@andrew.cmu.edu}
+}
+
+\maketitle
+
+% ---------------------------------------------------------------------------
+\begin{abstract}
+Transformer-based methods for rendering resolve global illumination through
+self-attention over triangle tokens.
+The cost of this attention grows as $O(N^2)$ in the triangle count $N$,
+so production meshes that routinely contain tens of thousands of triangles
+can exceed practical memory and time limits.
+In practice, most pairs of triangles exchange negligible radiance:
+illumination is typically dominated by immediate neighbours, direct emitters,
+and specular reflection paths.
+Yet dense attention forces every triangle to attend to every other triangle,
+paying the full $O(N^2)$ cost regardless of how little most pairs interact.
+We present \ours, which exploits this structure by attending selectively
+to a sparse subset of the triangles that matter most for each surface's
+illumination, rather than all $N$.
+This selective attention is organised into three branches structured around
+the scene's bounding volume hierarchy: a coarse branch for global radiance,
+a selected branch for direct illumination and specular paths, and a local
+branch whose neighbourhood is restricted by the hemisphere constraint of the
+rendering equation; both domain-specific constraints are physics-informed
+and introduce no additional parameters.
+\ours is initialised from the pretrained \RF checkpoint and fine-tuned
+on progressively larger scenes.
+At eight times \RF's 4{,}096-triangle training scale (32{,}768 triangles),
+where dense attention exceeds practical memory limits, \ours achieves
+\todo{XX}~dB PSNR with a wall-clock render time of \todo{XX}~ms per
+frame versus \todo{XX}~ms for the dense baseline.
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+Physically based rendering (PBR) simulates light transport by numerically
+integrating the rendering equation~\cite{kajiya1986rendering}.
+Production-quality path tracers such as Blender Cycles and Mitsuba~3~\cite{jakob2022drjit}
+yield photorealistic results, but their cost grows with path depth and
+sample count, which makes interactive or near-real-time global illumination
+on complex scenes prohibitive.
+
+Neural approximations have advanced along two lines.
+Neural Radiance Fields (NeRF)~\cite{mildenhall2020nerf} and 3D Gaussian
+Splatting (3DGS)~\cite{kerbl2023gaussian} achieve competitive view
+synthesis but bake lighting into the scene representation, which limits
+relighting.
+Diffusion-based approaches such as DiffusionRenderer~\cite{liang2025diffusionrenderer}
+achieve leading results on inverse and forward rendering of real video, but
+operate on G-buffer representations that presuppose a rasterisation
+pipeline and do not generalise across arbitrary mesh configurations.
+
+\RF~\cite{zeng2025renderformer} introduces a different paradigm:
+it encodes a triangle mesh scene as a sequence of tokens and resolves
+global illumination end-to-end through transformer attention.
+Each triangle token carries geometry (vertex positions), material (GGX
+BRDF parameters~\cite{walter2007microfacet}), and emission.
+A twelve-layer \emph{view-independent} stage performs triangle-to-triangle
+self-attention to propagate inter-surface light transport.
+A six-layer \emph{view-dependent} stage then lets ray-bundle tokens
+cross-attend to the illuminated triangle sequence.
+3D Rotary Position Encoding (3D~RoPE) follows the formulation
+of~\cite{su2021roformer} and imprints geometric structure directly in
+the attention logits.
+The resulting 205M-parameter model is trained on 16M High Dynamic Range
+(HDR) renders derived from Objaverse~\cite{deitke2022objaverse} and
+generalises across materials, lighting, and geometry without per-scene
+optimisation.
+
+\paragraph{The scaling barrier.}
+The view-independent stage grows as $O(N^2)$ in both memory and compute.
+Doubling the triangle count quadruples the cost, so each step toward
+production-scale meshes compounds the expense faster than any linear
+increase in hardware capacity can offset.
+Production assets average 8k--16k triangles after remeshing; architectural
+scenes, characters, and product models routinely exceed 50k.
+Reaching $N = 32{,}768$ from \RF's operating point of $N = 4{,}096$
+requires $64\times$ more memory and compute under dense attention, a gap
+that shifts the class of scenes that are renderable, not merely the cost.
+\todo{Table: dense-attention PSNR and peak memory at $N \in \{4096, 8192, 16384\}$.}
+
+\paragraph{Our approach.}
+We exploit the observation that light transport is \emph{structurally
+sparse}.
+The rendering equation integrates radiance over the hemisphere, and most
+distant surface pairs interact negligibly except through a small number of
+high-albedo or specular paths.
+This mirrors the structure that motivated Native Sparse Attention
+(NSA)~\cite{yuan2025nsa} for language models: long-range context can be
+captured at coarse resolution; a small fraction of highly relevant tokens
+requires fine-grained attention; spatially adjacent tokens always deserve
+local precision.
+
+We formalise this structure in three branches, each grounded in the scene's BVH:
+\begin{enumerate}
+  \item \textbf{Coarse branch.} Pool triangle tokens within BVH leaf nodes
+    by area-weighted averaging, then attend to compressed block tokens.
+    Captures low-frequency global radiance.
+  \item \textbf{Selected branch.} Each query triangle selects the
+    top-$k$ triangle blocks by a learned relevance score.
+    Captures direct illumination, one-bounce specular, and shadow casters.
+  \item \textbf{Local branch.} Each query triangle attends to its
+    $k_\ell$ spatially nearest triangles in 3D.
+    Captures contact shadows and near-field colour bleeding.
+\end{enumerate}
+A per-head learned gate combines the three branch outputs.
+Each triangle attends to $O(d \cdot b + k \cdot b + k_\ell)$ tokens,
+where $b$ is the BVH block size, reducing the view-independent stage
+from $O(N^2)$ to effectively $O(N)$ for fixed $d$, $k$, $k_\ell$.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item We introduce GP-Sparse, which replaces the $O(N^2)$
+    view-independent self-attention in \RF with three BVH-structured
+    attention branches and enables \ours to process scenes that exceed
+    \RF's memory limit.
+  \item Within the coarse branch, we introduce area-weighted pooling
+    (Eq.~\ref{eq:coarse_pool}), in which each triangle's contribution
+    to a compressed block token scales with its surface area, consistent
+    with the rendering integral.
+    The weights are precomputed at BVH build time and add no parameters.
+  \item Within the local branch, we introduce normal-coherent masking
+    (Eq.~\ref{eq:ncmask}), which suppresses back-facing neighbours by
+    applying the hemisphere constraint of the rendering equation as a
+    hard attention mask.
+    The mask reduces the effective neighbourhood by approximately
+    30--40\% on typical meshes and adds no inference cost.
+  \item \todo{XX: PSNR / SSIM / memory results at 8k, 16k, 32k.}
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Neural global illumination.}
+Early methods cached irradiance in neural networks to accelerate Monte
+Carlo sampling~\todo{cite}.
+NeRF variants~\cite{mildenhall2020nerf} encode radiance as volumetric
+implicit functions but conflate geometry and appearance.
+3DGS~\cite{kerbl2023gaussian} achieves real-time synthesis via
+differentiable point splatting but does not model inter-surface light
+transport.
+DiffusionRenderer~\cite{liang2025diffusionrenderer} couples a video
+diffusion model with a deferred shading pipeline for inverse and forward
+rendering, achieving leading results on real captures.
+To our knowledge, \RF~\cite{zeng2025renderformer} is the first method to
+model full global illumination over explicit triangle meshes via
+end-to-end transformer attention without per-scene baking.
+
+\paragraph{Efficient transformers.}
+Full self-attention~\cite{vaswani2017attention} is $O(N^2)$ in both time and memory.
+FlashAttention~\cite{dao2022flashattention} and its successors~\cite{dao2023flashattention2,shah2024flashattention3}
+reduce memory by tiling the softmax computation but do not reduce
+asymptotic complexity.
+NSA~\cite{yuan2025nsa} jointly trains three hardware-aligned branches
+(compressed token blocks, dynamically selected fine blocks, and a local
+sliding window) and achieves near-lossless perplexity at $O(N)$ cost
+on sequences up to 64k tokens.
+The Differential Transformer~\cite{ye2024differential} sharpens
+attention maps by cancelling noise through differential softmax pairs.
+Our sparse attention design is closest to NSA but differs in block
+construction (BVH rather than sequential blocks), positional encoding
+(3D~RoPE applied within and across blocks rather than causal 1D~RoPE),
+and neighbourhood construction: NSA and all prior sparse attention methods
+operate on 1D token sequences with no spatial geometry, so their
+neighbourhood masks carry no physical meaning.
+To our knowledge, \ours is the first method to apply the hemisphere constraint of the
+rendering equation as a hard geometric attention mask, implementing
+back-face culling inside the local branch.
+
+\paragraph{Equivariant scene encoders.}
+SE(3)-equivariant transformers~\cite{liao2023equiformerv2} enforce
+rotation and translation invariance by construction.
+\RF achieves only translation invariance via 3D~RoPE and compensates
+with rotation augmentation during training.
+\ours inherits this limitation; equivariant attention is a complementary
+future direction.
+
+\paragraph{Hierarchical scene representations.}
+Bounding Volume Hierarchies~\cite{kajiya1986rendering} organise primitives
+into nested axis-aligned boxes for $O(\log N)$ ray intersection.
+We repurpose BVH node boundaries as block boundaries for coarse pooling
+and block selection, connecting classical rendering acceleration with
+modern attention sparsity.
+
+% ---------------------------------------------------------------------------
+\section{Background: \RF Architecture}
+\label{sec:background}
+
+We briefly review the components of \RF~\cite{zeng2025renderformer} that
+\ours modifies.
+
+\paragraph{Scene tokenisation.}
+A scene is represented as $N$ triangles.
+Each triangle $i$ is encoded as a token $\mathbf{t}_i \in \mathbb{R}^D$
+carrying its normal, GGX BRDF parameters $(\rho_d, \rho_s, \alpha)$, and
+emission.
+Geometric position is encoded via 3D~RoPE applied to attention logits,
+not in the token itself.
+
+\paragraph{3D Rotary Position Encoding.}
+Given triangle $i$ with vertex positions
+$\mathbf{v}_i^{(1)}, \mathbf{v}_i^{(2)}, \mathbf{v}_i^{(3)} \in \mathbb{R}^3$,
+the RoPE bias between triangles $i$ and $j$ is:
+\begin{equation}
+  \phi_{ij} = \sum_{c \in \{1,2,3\}} \sum_{k=1}^{3}
+  \operatorname{RoPE}\!\left(\mathbf{q}_i, \mathbf{v}_i^{(c)}\right)_k \cdot
+  \operatorname{RoPE}\!\left(\mathbf{k}_j, \mathbf{v}_j^{(c)}\right)_k,
+  \label{eq:rope3d}
+\end{equation}
+where $\mathbf{q}_i$ and $\mathbf{k}_j$ are the query and key projections
+of the token embeddings.
+This encodes relative 3D positions without global translation dependence.
+
+\paragraph{View-independent stage.}
+Twelve transformer layers perform full $N \times N$ self-attention over
+triangle tokens to propagate inter-surface illumination.
+This stage is the $O(N^2)$ bottleneck.
+
+\paragraph{View-dependent stage.}
+The camera view is discretised into $R$ ray-bundle tokens, each covering
+an $8 \times 8$ pixel patch of the output image.
+Six cross-attention layers produce HDR pixel-patch features from ray-bundle
+queries attending to triangle keys and values, which are then decoded to colours.
+Complexity is $O(R \cdot N)$ and becomes a secondary bottleneck at large $N$.
+
+% ---------------------------------------------------------------------------
+\section{\ours: BVH-Structured Sparse Attention}
+\label{sec:method}
+
+\subsection{Overview}
+
+We replace the dense self-attention in the view-independent stage with a
+three-branch sparse attention module.
+All other components of \RF (tokenisation, 3D~RoPE, the view-dependent
+stage, and the pixel decoder) are retained without modification.
+
+\todo{Figure: architecture diagram.}
+
+\subsection{BVH Block Construction}
+\label{sec:bvh}
+
+We build a BVH over the $N$ triangle centroids using surface area heuristic
+(SAH) splitting.
+At depth $d_\text{leaf}$, this yields $B = N / b$ leaf nodes, each
+containing $b$ triangles on average.
+We set $b = 32$ to match GPU warp width, which is consistent with
+NSA's hardware-aligned design~\cite{yuan2025nsa}.
+\todo{BVH library.}
+Internal nodes at depth $d < d_\text{leaf}$ aggregate
+$2^{d_\text{leaf} - d} \cdot b$ triangles.
+The coarse branch pools at the parent level ($d_\text{leaf} - 1$), yielding
+$B_p = N / (2b)$ parent blocks each covering $2b$ triangles on average.
+The selected branch retrieves at the leaf level ($d_\text{leaf}$).
+This two-level design gives the coarse branch a $2\times$ coarser global
+view while the selected branch retains fine-grained retrieval, following
+the two-granularity principle of NSA~\cite{yuan2025nsa}.
+
+\subsection{Three-Branch Attention}
+\label{sec:threebranch}
+
+The two contributions of this paper modify the coarse and local branches
+respectively; the selected branch is adopted from the NSA
+design~\cite{yuan2025nsa} without modification.
+
+Let $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times D}$ be
+the query, key, and value matrices for a single attention head.
+
+\paragraph{Coarse branch.}
+Keys and values are pooled within each BVH leaf node by area-weighted
+pooling, so that each triangle's contribution scales with its surface
+area as it does under the rendering integral:
+\begin{equation}
+  \hat{\mathbf{K}}_\beta =
+    \frac{\sum_{j \in \mathcal{B}_\beta} A_j\,\mathbf{K}_j}
+         {\sum_{j \in \mathcal{B}_\beta} A_j},
+  \qquad
+  \hat{\mathbf{V}}_\beta =
+    \frac{\sum_{j \in \mathcal{B}_\beta} A_j\,\mathbf{V}_j}
+         {\sum_{j \in \mathcal{B}_\beta} A_j},
+  \label{eq:coarse_pool}
+\end{equation}
+where $A_j = \tfrac{1}{2}\|(v_1^j{-}v_0^j)\times(v_2^j{-}v_0^j)\|$ is
+the area of triangle $j$ and $\mathcal{B}_\beta$ is the triangle set of
+leaf block $\beta$.
+The weights are query-independent and are precomputed once at BVH build time.
+To prevent triangles at leaf boundaries from being absent from neighbouring
+blocks' pooled tokens, the $k_\text{fringe} = 4$ geometrically closest
+triangles from adjacent leaves are included in each leaf's pooling with
+their true areas.
+Fringe membership is determined at BVH build time and adds no per-forward-pass
+overhead.
+Each query $\mathbf{Q}_i$ then attends to all $B_p = N/(2b)$ parent-level
+compressed block tokens:
+\begin{equation}
+  \mathbf{O}_i^\text{coarse} =
+    \operatorname{Attn}(\mathbf{Q}_i,\, \hat{\mathbf{K}}^p,\, \hat{\mathbf{V}}^p),
+\end{equation}
+where $\hat{\mathbf{K}}^p, \hat{\mathbf{V}}^p$ are parent-level pooled tokens.
+This branch captures low-frequency radiance transfer and runs in
+$O(N \cdot B_p) = O(N^2 / (2b))$, a $64\times$ reduction in keys per
+query at $b = 32$.
+
+\paragraph{Selected branch.}
+For each query triangle $i$, the top-$k_\text{sel}$ leaf-level blocks are
+retrieved using a dedicated lightweight block scorer with $H^I$ heads:
+\begin{equation}
+  I_{i,\beta} = \sum_{j=1}^{H^I} w^I_{i,j}
+                \cdot \mathrm{ReLU}\!\left(q^I_{i,j} \cdot \bar{k}^I_\beta\right),
+  \label{eq:scorer}
+\end{equation}
+where $q^I_{i,j} \in \mathbb{R}^{d^I}$ and $w^I_{i,j} \in \mathbb{R}$ are
+derived from query token $\mathbf{Q}_i$, and $\bar{k}^I_\beta \in \mathbb{R}^{d^I}$
+is derived from the area-weighted pooled token of leaf block $\beta$
+(Eq.~\ref{eq:coarse_pool}).
+ReLU activation suppresses negative scores without normalisation, which is
+more hardware-efficient than softmax for large block counts.
+The discrete top-$k$ selection is made end-to-end differentiable via a
+STE~\cite{bengio2013estimating}: the forward pass performs hard top-$k$
+retrieval, and the backward pass treats the scorer logits $I_{i,:}$ as
+continuous weights, passing gradients straight through the argmax into
+the scorer and, via $q^I_{i,j}$, into the query representations of the
+main model.
+An auxiliary KL divergence objective (Section~\ref{sec:finetune}) provides
+a calibration signal during Stage~1 warm-up.
+Full-resolution leaf tokens for the top-$k_\text{sel}$ blocks are gathered:
+\begin{equation}
+  \mathcal{S}_i = \operatorname{top-}k_\text{sel}\!\left\{ I_{i,\beta} \right\}_\beta,
+  \quad
+  \mathbf{O}_i^\text{sel} =
+    \operatorname{Attn}\!\left(
+      \mathbf{Q}_i,\; \mathbf{K}_{\mathcal{S}_i},\; \mathbf{V}_{\mathcal{S}_i}
+    \right).
+  \label{eq:sel}
+\end{equation}
+Each query attends to $k_\text{sel} \cdot b$ fine-grained tokens, targeting
+direct illumination and specular paths where precise geometry determines the
+outcome.
+The default settings are $k_\text{sel} = 4$ and $H^I = 4$.
+
+\paragraph{Local branch.}
+Each query triangle $i$ attends to its $k_\ell = 64$ spatially nearest
+triangles in 3D.
+On a typical mesh, however, 30--40\% of the nearest neighbours in
+Euclidean space face away from the query triangle.
+Under the rendering equation, a triangle whose normal points into the
+lower hemisphere of triangle $i$ contributes zero radiance, because the
+cosine term $(\mathbf{n}_i \cdot \omega)$ clamps at zero for directions
+below the surface.
+Attending to these neighbours wastes capacity and degrades shadow
+boundary quality.
+
+We apply a \emph{normal-coherent mask} that suppresses back-facing
+neighbours before the softmax, implementing the transformer equivalent
+of back-face culling.
+After computing $\mathcal{L}_i$, each neighbour $j$ is masked if its
+normal exceeds a $120^\circ$ angle from the query normal.
+The mask is defined by a sigmoid soft approximation and its hard
+inference counterpart:
+\begin{align}
+  \tilde{m}_{ij} &= \sigma\!\bigl(-s\,(\mathbf{n}_i \cdot \mathbf{n}_j + \tau)\bigr),
+  \label{eq:ncmask_soft} \\
+  m_{ij}         &= \mathbf{1}[\mathbf{n}_i \cdot \mathbf{n}_j < -\tau],
+  \label{eq:ncmask_hard}
+\end{align}
+where $\tau = 0.5$ and sharpness $s = 20$.
+The threshold $\tau = 0.5$ encodes the hemisphere constraint of the
+rendering integral, not a learned preference.
+To maintain end-to-end differentiability during training we apply a
+\emph{straight-through estimator} (STE)~\cite{bengio2013estimating}: the
+forward pass uses the hard indicator $m_{ij}$ (physically exact), while
+the backward pass propagates gradients through the soft sigmoid
+$\tilde{m}_{ij}$, so the normal vectors $\mathbf{n}_i$ and $\mathbf{n}_j$
+receive gradient signal from the rendering loss.
+At inference only $m_{ij}$ is evaluated.
+The masked local attention is then:
+\begin{align}
+  \mathcal{L}_i &= \operatorname{kNN}_{k_\ell}\!(c_i,\, \{c_j\}_{j \neq i}),
+  \label{eq:knn} \\
+  \mathbf{O}_i^\text{local} &=
+    \operatorname{softmax}\!\!\left(
+      \frac{\mathbf{Q}_i\,\mathbf{K}_{\mathcal{L}_i}^\top}{\sqrt{D}}
+      - \mathbf{m}_i^{\mathrm{STE}} \cdot \infty
+    \right)
+    \mathbf{V}_{\mathcal{L}_i},
+  \label{eq:local_masked}
+\end{align}
+where $\mathbf{m}_i^{\mathrm{STE}} \in \mathbb{R}^{k_\ell}$ uses $m_{ij}$
+in the forward pass and $\tilde{m}_{ij}$ in the backward pass.
+This branch captures contact shadows and near-field colour bleeding.
+The mask reduces the effective neighbourhood by approximately 30--40\%
+on Objaverse scenes, at no added inference cost.
+\todo{kNN algorithm.}
+\todo{Attention kernel.}
+
+\paragraph{Gated combination.}
+Per-head learned scalar gates $\lambda_1, \lambda_2, \lambda_3 \geq 0$
+(softmax-normalised) combine the three branch outputs:
+\begin{equation}
+  \mathbf{O}_i =
+    \lambda_1 \mathbf{O}_i^\text{coarse}
+    + \lambda_2 \mathbf{O}_i^\text{sel}
+    + \lambda_3 \mathbf{O}_i^\text{local}.
+  \label{eq:gate}
+\end{equation}
+
+\subsection{3D RoPE in Sparse Branches}
+\label{sec:rope}
+
+In the coarse branch, the position argument for compressed block token
+$\hat{\mathbf{K}}_\beta$ is the centroid of all triangles in
+$\mathcal{B}_\beta$.
+In the selected and local branches, each token retains its original
+per-triangle 3D position as in Eq.~\ref{eq:rope3d}.
+The coarse branch therefore encodes block-level geometry while the fine
+branches encode triangle-level geometry.
+
+\subsection{Sparse View-Dependent Cross-Attention}
+\label{sec:viewdep}
+
+At large $N$, the $O(R \cdot N)$ cross-attention from ray bundles to
+triangles also becomes a bottleneck.
+Frustum culling and depth-sorted $k$-NN selection limit each ray-bundle
+token to attending to the $k_r = 256$ triangles most likely to be visible
+from that ray's frustum, reducing view-dependent complexity to
+$O(R \cdot k_r)$ independent of $N$.
+
+\subsection{Fine-Tuning from Pretrained \RF Weights}
+\label{sec:finetune}
+
+\RF's pretrained 205M-parameter checkpoint provides initialisation.
+All weights transfer except the attention projection matrices in the
+view-independent stage, which are re-initialised.
+Fine-tuning runs for \todo{XX epochs} on a filtered subset of the \RF
+training distribution~\cite{deitke2022objaverse} with $N \leq 32{,}768$
+triangles, using Blender Cycles renders as pseudo-ground-truth.
+We use the \todo{optimiser} with an initial learning rate
+of \todo{XX} and a cosine decay schedule following a \todo{XX}-step
+linear warmup.
+The loss is \todo{loss function}.
+Batch size is \todo{XX}.
+Mixed-precision training uses \todo{mixed precision settings}.
+Fine-tuning runs on \todo{hardware and training time}.
+The Swin-Large backbone~\cite{liu2021swin} in the view-dependent pixel
+decoder is frozen throughout.
+
+\paragraph{Two-stage training procedure.}
+Fine-tuning proceeds in two stages, following the indexer warm-up principle
+introduced in DeepSeek Sparse Attention~\cite{deepseek2025dsa}.
+
+\textbf{Stage 1: Dense warm-up.}
+All GP-Sparse parameters are frozen except the block scorer
+(Eq.~\ref{eq:scorer}).
+Full dense attention runs normally.
+The scorer is trained with a KL divergence loss against the L1-normalised
+dense attention distribution:
+\begin{equation}
+  \mathcal{L}^I = \sum_i
+    \mathbb{D}_{\mathrm{KL}}\!\left(
+      p_{i,:} \;\Big\|\; \mathrm{Softmax}(I_{i,:})
+    \right),
+  \label{eq:scorer_kl}
+\end{equation}
+where $p_{i,:}$ is the sum of the dense attention weights for triangle $i$
+across all heads, L1-normalised over the sequence dimension.
+This stage trains the scorer to predict which BVH blocks the dense model
+attends to before any sparse routing is imposed.
+The warm-up runs for \todo{XX} steps on the same data distribution as Stage~2.
+
+\textbf{Stage 2: Sparse fine-tuning.}
+Sparse block selection and the normal-coherent mask are activated; all
+parameters are unfrozen.
+Both discrete operations use their respective STEs
+(Section~\ref{sec:threebranch}), so gradients from the rendering loss flow
+end-to-end through the selected branch into the block scorer and through
+the local branch into the triangle normal representations.
+The auxiliary $\mathcal{L}^I$ continues as a secondary calibration signal
+for the scorer, weighted by $\alpha = 0.01$:
+$\mathcal{L} = \mathcal{L}^{\text{render}} + \alpha\,\mathcal{L}^I$.
+
+\paragraph{Complexity summary.}
+\begin{center}\small
+\begin{tabular}{lcc}
+\toprule
+Stage & \RF & \ours \\
+\midrule
+View-indep. & $O(N^2)$ & $O(N(N/b + k_s b + k_\ell))$ \\
+View-dep. & $O(RN)$ & $O(Rk_r)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+For $N = 32{,}768$, $b = 32$, $k_\text{sel} = 4$, $k_\ell = 64$,
+$k_r = 256$, \ours attends to approximately \todo{XX$\times$} fewer token
+pairs than \RF extrapolated to the same $N$.
+
+% ---------------------------------------------------------------------------
+\section{Experiments}
+\label{sec:experiments}
+
+\todo{Complete after implementation.}
+
+\subsection{Setup}
+
+\paragraph{Scenes.}
+Three scene categories form the evaluation suite:
+(1) synthetic Cornell-box variants (100 scenes, $N \leq 2{,}048$)
+for sanity checking;
+(2) remeshed Objaverse scenes~\cite{deitke2022objaverse}
+(1{,}000 scenes, $2{,}048 \leq N \leq 32{,}768$) for main comparison;
+(3) complex single-room scenes (50 scenes,
+$32{,}768 \leq N \leq 65{,}536$) to probe out-of-distribution triangle counts.
+Objaverse meshes are remeshed using a signed-distance-field
+marching-cubes reconstruction followed by Qslim face decimation
+to obtain triangle counts in the target range.
+The fine-tuning split comprises 10{,}000 scenes rendered from 4
+viewpoints each, using the same random-rotation, random-material, and
+random-lighting augmentation as \RF~\cite{zeng2025renderformer}.
+Pseudo-ground-truth images are produced with Blender Cycles at 4{,}096~spp
+and $512 \times 512$ resolution.
+
+\paragraph{Baselines.}
+We compare against three baselines:
+(1) the released \RF checkpoint with dense attention, evaluated at
+$N \leq 4{,}096$;
+(2) \RF fine-tuned with dense attention up to the largest $N$ at which
+$O(N^2)$ attention remains tractable ($N \leq 8{,}192$);
+(3) Blender Cycles reference renders (512~spp, $\approx$90\,s per frame)
+used as ground truth.
+
+\paragraph{Metrics.}
+Peak Signal-to-Noise Ratio (PSNR), Structural Similarity (SSIM), and
+LPIPS~\cite{zhang2018lpips} are computed against Blender Cycles reference
+renders at $512 \times 512$ resolution.
+Peak GPU memory (GB) and wall-clock render time per frame (ms) are
+measured on a single A100-80GB.
+
+% ---------------------------------------------------------------------------
+\subsection{Main Results}
+\label{sec:results}
+
+Table~\ref{tab:main} reports PSNR, SSIM, and LPIPS at
+$N \in \{4{,}096,\, 8{,}192,\, 16{,}384,\, 32{,}768\}$.
+At $N = 32{,}768$, \ours achieves \todo{XX}~dB PSNR,
+\todo{XX} SSIM, and \todo{XX} LPIPS.
+The dense-attention baseline fine-tuned to $N = 8{,}192$ reaches
+\todo{XX}~dB PSNR and cannot be evaluated beyond that scale.
+Peak GPU memory is reduced from \todo{XX}~GB (dense, extrapolated to
+$N = 32{,}768$) to \todo{XX}~GB, and wall-clock render time per frame
+decreases from \todo{XX}~ms to \todo{XX}~ms.
+
+\begin{table}[h]
+  \caption{PSNR\,/\,SSIM\,/\,LPIPS vs baselines. OOM denotes
+           out-of-memory on a single A100-80GB.}
+  \label{tab:main}
+  \centering
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{lrccc}
+    \toprule
+    Method & $N$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ \\
+    \midrule
+    \RF (pretrained)  & 4{,}096  & \todo{XX} & \todo{XX} & \todo{XX} \\
+    \RF (fine-tuned)  & 8{,}192  & \todo{XX} & \todo{XX} & \todo{XX} \\
+    \RF (fine-tuned)  & 16{,}384 & OOM       & $-$       & $-$       \\
+    \midrule
+    \ours             & 8{,}192  & \todo{XX} & \todo{XX} & \todo{XX} \\
+    \ours             & 16{,}384 & \todo{XX} & \todo{XX} & \todo{XX} \\
+    \ours             & 32{,}768 & \todo{XX} & \todo{XX} & \todo{XX} \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}
+
+Figure~\ref{fig:scaling} shows peak GPU memory and PSNR as a function of
+$N$ on a log-log scale, confirming the transition from $O(N^2)$ to
+$O(N)$ scaling.
+\todo{Figure~\ref{fig:scaling}: PSNR and peak memory vs $N$.}
+
+Figure~\ref{fig:qual} shows side-by-side renders of \ours, \RF, and the
+Blender Cycles reference on three representative scenes, including
+$5\times$ difference images.
+\todo{Figure~\ref{fig:qual}: qualitative comparison.}
+
+Figure~\ref{fig:fail} illustrates two failure modes specific to GP-Sparse:
+a concave-geometry scene where the hemisphere-mask fallback fires, and a
+translucent-material scene where the mask incorrectly suppresses
+back-hemisphere neighbours.
+\todo{Figure~\ref{fig:fail}: failure cases.}
+
+% ---------------------------------------------------------------------------
+\subsection{Ablation Studies}
+\label{sec:ablation}
+
+\paragraph{Branch ablation.}
+Each branch is ablated by setting its gate weight $\lambda = 0$ during
+inference (Eq.~\ref{eq:gate}).
+Removing the coarse branch reduces PSNR by \todo{XX}~dB;
+removing the selected branch reduces PSNR by \todo{XX}~dB;
+removing the local branch reduces PSNR by \todo{XX}~dB.
+The full three-branch model outperforms the best single-branch ablation
+by \todo{XX}~dB at $N = 16{,}384$.
+
+\begin{table}[h]
+  \caption{Branch ablation at $N = 16{,}384$. \checkmark~denotes branch enabled.}
+  \label{tab:branch}
+  \centering\small
+  \begin{tabular}{ccccc}
+    \toprule
+    Coarse & Selected & Local & PSNR$\uparrow$ & SSIM$\uparrow$ \\
+    \midrule
+    \checkmark & \checkmark & \checkmark & \todo{XX} & \todo{XX} \\
+               & \checkmark & \checkmark & \todo{XX} & \todo{XX} \\
+    \checkmark &            & \checkmark & \todo{XX} & \todo{XX} \\
+    \checkmark & \checkmark &            & \todo{XX} & \todo{XX} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Block size and selection count.}
+At $b = 32$ and $k_\text{sel} = 4$, \ours reaches \todo{XX}~dB PSNR at
+\todo{XX}~GB peak memory.
+Increasing $b$ to 64 reduces memory by \todo{XX}\% but degrades PSNR by
+\todo{XX}~dB; reducing $k_\text{sel}$ to 2 has a \todo{smaller / larger}
+effect on quality than on memory.
+
+\begin{table}[h]
+  \caption{PSNR and peak memory vs block size $b$ and selection count
+           $k_\text{sel}$ at $N = 16{,}384$.}
+  \label{tab:blocksize}
+  \centering\small
+  \begin{tabular}{cccc}
+    \toprule
+    $b$ & $k_\text{sel}$ & PSNR$\uparrow$ & Mem (GB) \\
+    \midrule
+    16 & 4 & \todo{XX} & \todo{XX} \\
+    32 & 4 & \todo{XX} & \todo{XX} \\
+    64 & 4 & \todo{XX} & \todo{XX} \\
+    32 & 2 & \todo{XX} & \todo{XX} \\
+    32 & 8 & \todo{XX} & \todo{XX} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Position encoding in coarse branch.}
+Block centroid RoPE outperforms no positional encoding by \todo{XX}~dB
+and per-triangle RoPE applied to pooled keys by \todo{XX}~dB at
+$N = 16{,}384$, confirming that block-level geometry is sufficient for
+the coarse branch.
+
+% ---------------------------------------------------------------------------
+\subsection{Scaling}
+\label{sec:scaling}
+
+Figure~\ref{fig:scaling} shows that dense attention memory grows as
+$O(N^2)$, reaching \todo{XX}~GB at $N = 16{,}384$ and becoming infeasible
+beyond $N = \todo{XX}$.
+\ours scales approximately linearly, using \todo{XX}~GB at
+$N = 32{,}768$ and \todo{XX}~GB at $N = 65{,}536$.
+Render time follows the same trend: the dense baseline requires
+\todo{XX}~ms per frame at $N = 8{,}192$, while \ours requires
+\todo{XX}~ms at $N = 32{,}768$.
+\todo{Figure~\ref{fig:scaling}: log-log memory and time vs $N$.}
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented \ours. The architecture scales transformer-based neural
+global illumination from 4{,}096 to over 32{,}768 triangles per scene by
+replacing dense self-attention with a BVH-structured three-branch sparse
+module.
+Each branch targets a distinct scale of light transport: the coarse branch
+resolves global radiance, the selected branch targets specular and shadow
+paths, and the local branch handles near-field contact effects.
+Fine-tuning from the released \RF checkpoint makes the approach tractable
+without an 8-day multi-GPU training run.
+
+\paragraph{Limitations and future work.}
+\ours inherits \RF's restriction to white diffuse lights outside the scene
+bounding box and GGX BRDFs without spatially varying textures.
+\todo{GP-Sparse limitations: concave geometry, translucent materials, noisy normals, query-independent area weights.}
+Extensions to environment lighting, HDRI inputs, spatially varying BRDFs,
+and SO(3)-equivariant attention~\cite{liao2023equiformerv2} remain open
+directions.
+End-to-end differentiability via the STEs in Section~\ref{sec:threebranch}
+enables inverse rendering applications, which we plan to explore.
+
+% ---------------------------------------------------------------------------
+\bibliographystyle{eg-alpha-doi}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,310 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\definecolor{accent}{RGB}{30,90,180}
+\definecolor{warn}{RGB}{180,60,30}
+\definecolor{muted}{RGB}{100,100,100}
+
+\hypersetup{colorlinks=true, linkcolor=accent, urlcolor=accent, breaklinks=true}
+\def\UrlBreaks{\do\/\do-\do\_\do.}
+
+\titleformat{\section}{\large\bfseries\color{accent}}{}{0em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\textcolor{muted}{\small SparseRenderFormer}}
+\lhead{\textcolor{muted}{\small Team Action Steps}}
+\cfoot{\thepage}
+
+\newcommand{\role}[1]{\textbf{[#1]}}
+\newcommand{\critical}[1]{\textcolor{warn}{\textbf{#1}}}
+\newcommand{\sq}{\item[$\square$]}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries SparseRenderFormer}\\[4pt]
+  {\large Team Action Steps}\\[6pt]
+  {\color{muted} Team size: 4\quad Transformer experience: beginner\quad Target: 11~weeks}
+\end{center}
+
+\vspace{6pt}
+\noindent\critical{Critical path:} Start data rendering (Phase~2) in Week~2, not after
+implementation. Blender renders are compute-bound and must run overnight on the GPU
+throughout development. Waiting for code to finish before generating data costs two weeks.
+
+\vspace{6pt}
+
+%-----------------------------------------------------------------------
+\section{Phase~0\quad Learning Sprint \textnormal{(Week~1, all~4)}}
+
+One focused week. Everyone works through the list independently, then the team
+discusses together.
+
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Watch Andrej Karpathy ``Let's build GPT from scratch'' (YouTube, $\approx$2~hrs)
+  \sq Read ``Attention Is All You Need'' --- Vaswani et al., NeurIPS 2017
+  \sq Read RenderFormer paper --- arXiv:2505.21925 (SIGGRAPH 2025)
+  \sq Read NSA paper --- arXiv:2502.11089 (direct design inspiration for GP-Sparse)
+  \sq Read \texttt{about\_sparserenderformer.tex} in this repo
+  \sq Read \texttt{CLAUDE.md} for method design and token format
+  \sq Clone RenderFormer: \texttt{git clone https://github.com/microsoft/renderformer}
+  \sq Run RenderFormer inference on the Cornell box scene
+\end{itemize}
+
+\noindent\textbf{Exit criterion:} every team member can explain what the coarse, selected,
+and local branches do and why they reduce attention complexity from $O(N^2)$ to $O(N)$.
+
+%-----------------------------------------------------------------------
+\section{Phase~1\quad Engineering Setup \textnormal{(Weeks~1--2, split by role)}}
+
+\subsection{\role{P1} ML infrastructure}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Confirm GPU allocation (A100-80\,GB recommended; A6000 workable for ablations)
+  \sq Set up Python environment: PyTorch~2.x, Triton $\geq$~3.x
+  \sq Install Weights \& Biases (or MLflow) for experiment tracking
+  \sq Back up RenderFormer pretrained checkpoint to shared storage before fine-tuning
+\end{itemize}
+
+\subsection{\role{P2} Baseline reproduction}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Download checkpoint \texttt{microsoft/renderformer-v1.1-swin-large} from HuggingFace
+  \sq Run inference on one Objaverse scene end to end
+  \sq Reproduce one PSNR number from Table~1 of the RenderFormer paper
+  \sq Document the exact command used and the result in a shared note
+\end{itemize}
+
+\subsection{\role{P3} Rendering stack}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Install Dr.Jit / Mitsuba~3 for reference renders
+  \sq Install Blender headless (\texttt{bpy}) for dataset generation
+  \sq Smoke test: render Cornell box with Blender Cycles (512\,spp, HDR output)
+\end{itemize}
+
+\subsection{\role{P4} Repository and paper}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Create public GitHub repo (suggested name: \texttt{sparserenderformer})
+  \sq Add MIT or Apache~2.0 \texttt{LICENSE} file
+  \sq Write README skeleton: installation, quick-start, citation block
+  \sq Register account on target submission system (CMT / OpenReview --- confirm venue first)
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Phase~2\quad Data Pipeline \textnormal{(Start Week~2, run in background throughout)}}
+
+\critical{Do not wait until implementation is done.} Launch renders on the GPU as soon as
+Blender is installed and let them accumulate overnight throughout Phases~3 and~4.
+
+\subsection{\role{P3} Dataset construction}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Get access to RenderFormer's Objaverse subset (see repo README for download link)
+  \sq Filter Objaverse by triangle count; write remesh script for
+      $N \in \{4\text{k},\,8\text{k},\,16\text{k},\,32\text{k}\}$
+  \sq Set up Blender Cycles pipeline: 512\,spp, HDR output, consistent lighting
+\end{itemize}
+
+\subsection{\role{P1} Dataset generation}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Generate $\geq\!1{,}000$ training scenes at $N = 16\text{k}$ triangles
+  \sq Generate 50--100 held-out evaluation scenes at $N = 32\text{k}$ triangles
+  \sq Write data loader that handles variable triangle counts
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Phase~3\quad Implementation \textnormal{(Weeks~2--7, P1 + P2)}}
+
+\subsection{\role{P1} BVH and coarse branch}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Implement BVH construction (SAH splitting, block size $b = 32$)
+  \sq Implement coarse branch: area-weighted average pooling within BVH leaf nodes
+  \sq Extend 3D RoPE to coarse branch using block centroid as position
+  \sq Unit test: coarse branch output shape and gradient flow
+\end{itemize}
+
+\subsection{\role{P2} Selected and local branches}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Implement selected branch: top-$k$ BVH block selection per query via dot-product scores
+  \sq Implement local branch: 3D kNN ($k = 64$) per query
+  \sq Add normal-coherent mask with STE: hard threshold $\mathbf{n}_i \cdot \mathbf{n}_j < -0.5$
+      in forward pass; sigmoid soft mask ($s = 20$) in backward pass for gradient flow to normals
+  \sq Unit test: selected branch retrieves expected blocks on a synthetic scene
+  \sq Unit test: local branch kNN distances and mask correctness
+\end{itemize}
+
+\subsection{\role{P1 + P2} Integration}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Implement gated combination (Eq.~5): per-head learned scalars
+      $\lambda_1, \lambda_2, \lambda_3$ with softmax normalisation
+  \sq Implement sparse view-dependent cross-attention: frustum culling + kNN ($k_r = 256$)
+  \sq Fork and adapt RenderFormer codebase to slot in the GP-Sparse module
+  \sq \critical{Sanity check:} at $N = 4{,}096$ with $k_\text{sel} = 128$,
+      GP-Sparse output must match dense attention exactly
+\end{itemize}
+
+\subsection{\role{P2} Optional (if time allows)}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Profile naive PyTorch masking first; port NSA Triton kernel from DeepSeek-V3
+      repo only if this is the bottleneck
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Phase~4\quad Experiments \textnormal{(Weeks~5--9, overlaps Phase~3 tail)}}
+
+Start running experiments on completed branches as soon as each passes unit tests.
+Do not wait for full integration.
+
+\subsection{\role{P4} Baselines}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq RenderFormer pretrained, $N = 4{,}096$ \quad PSNR = \underline{\hspace{2.5cm}}
+  \sq RenderFormer fine-tuned, $N = 8{,}192$ (dense, max memory)
+      \quad PSNR = \underline{\hspace{2.5cm}}
+\end{itemize}
+
+\subsection{\role{P1 + P2} Main results}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Ours $N = 8{,}192$ \quad
+      PSNR = \underline{\phantom{XX}}\,dB \quad
+      Memory = \underline{\phantom{XX}}\,GB \quad
+      Time = \underline{\phantom{XX}}\,ms
+  \sq Ours $N = 16{,}384$ \quad
+      PSNR = \underline{\phantom{XX}}\,dB \quad
+      Memory = \underline{\phantom{XX}}\,GB \quad
+      Time = \underline{\phantom{XX}}\,ms
+  \sq Ours $N = 32{,}768$ \quad
+      PSNR = \underline{\phantom{XX}}\,dB \quad
+      Memory = \underline{\phantom{XX}}\,GB \quad
+      Time = \underline{\phantom{XX}}\,ms
+  \sq Log-log memory vs.\ $N$ plot (RF dense vs.\ GP-Sparse)
+  \sq Log-log render time vs.\ $N$ plot (RF dense vs.\ GP-Sparse)
+\end{itemize}
+
+\subsection{\role{P4} Ablations}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Remove coarse branch, $N = 16\text{k}$ \quad PSNR = \underline{\hspace{2.5cm}}
+  \sq Remove selected branch, $N = 16\text{k}$ \quad PSNR = \underline{\hspace{2.5cm}}
+  \sq Remove local branch, $N = 16\text{k}$ \quad PSNR = \underline{\hspace{2.5cm}}
+  \sq Block size $b \in \{16, 32, 64\}$ at $N = 16\text{k}$
+  \sq $k_\text{sel} \in \{2, 4, 8\}$ at $N = 16\text{k}$
+\end{itemize}
+
+\subsection{\role{P3} Visual results}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Render visual gallery: Cornell box, 3 Objaverse scenes, 1 room scene
+  \sq Side-by-side comparison figures: RF dense vs.\ GP-Sparse at $N = 32\text{k}$
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Phase~5\quad Paper Completion \textnormal{(Weeks~7--10, overlaps experiments)}}
+
+Start writing method, related work, and setup sections during implementation.
+Fill in numbers as they arrive --- do not wait for every experiment to finish.
+
+\subsection{\role{P4} Fill \texttt{\textbackslash{}todo} items in \texttt{overleaf/main.tex}}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Abstract: PSNR gain (dB), memory reduction (\%), render time reduction (\%)
+  \sq Table~1: main results --- all PSNR / SSIM / LPIPS numbers
+  \sq Table~2: branch ablation --- all 7 subsets at $N = 16{,}384$
+  \sq Figure: memory/time scaling log-log plot
+  \sq \S4.3: complexity ratio (XX$\times$ fewer token pairs)
+  \sq \S5.3: fine-tuning epoch count
+  \sq Conclusion: update all numbers
+\end{itemize}
+
+\subsection{\role{P4} Writing pass (CHECKLIST \S8b rules, in order)}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Abstract: no \texttt{\textbackslash{}cite\{todo\}} remain; target 150--220 words
+  \sq Introduction: no consecutive sentences starting with the same word
+  \sq Related Work: same sentence-start check
+  \sq Method (\S4): all equations referenced in text
+  \sq Experiments (\S5): no vague descriptors; report $\pm$std where applicable
+  \sq Conclusion: no new results introduced; $\leq 150$ words
+  \sq Dash audit:
+      \texttt{grep -n "{-}{-}{-}" overleaf/main.tex | grep -v "\^{}\%"} must return zero hits
+  \sq Banned-word grep: \emph{remarkable, impressive, strong, novel, intricate,
+      delve, underscore, pivotal}
+\end{itemize}
+
+\subsection{\role{All} Remaining sections}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Acknowledgments: funding source, compute credits, dataset access
+  \sq Ethics / Broader Impact statement
+  \sq Supplementary material: extended ablations, additional renders, implementation details
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Phase~6\quad Submission \textnormal{(Week~11)}}
+
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Confirm venue and hard deadline: \underline{\hspace{5cm}}\\
+      (SIGGRAPH Asia~2026, 3DV~2026, or ICCV~2027)
+  \sq Submit arXiv preprint at least 1~week before conference deadline
+  \sq Switch to anonymous mode in \texttt{main.tex}: toggle
+      \texttt{ConferencePaper} $\to$ \texttt{ConferenceSubmission}
+      and remove the author block
+  \sq Page limit check: 8~pages + references
+  \sq Upload fine-tuned checkpoint to HuggingFace Hub
+  \sq Tag \texttt{v1.0} GitHub release at submission time
+\end{itemize}
+
+\noindent\textbf{After arXiv is live:}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \sq Post to r/MachineLearning and r/computergraphics
+  \sq Email RenderFormer authors (Chong Zeng, Microsoft Research Asia) with a
+      one-paragraph note and preprint link; they may share feedback or repost
+  \sq Add paper to Papers With Code
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Compute Credits (apply as early as possible)}
+
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \item AWS Research Credits ---
+        \url{https://aws.amazon.com/research-credits}
+  \item Google TPU Research Cloud ---
+        \url{https://sites.research.google/trc}
+  \item Microsoft AFMR (Accelerate Foundation Models Research):\\
+        {\footnotesize\url{https://microsoft.com/en-us/research/collaboration/accelerate-foundation-models-research}}
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Optimised Timeline}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}clll@{}}
+  \toprule
+  \textbf{Weeks} & \textbf{Phase} & \textbf{Who} & \textbf{Note} \\
+  \midrule
+  1     & Learning sprint           & All 4             & Compressed to 1 focused week \\
+  1--2  & Engineering setup         & P1 P2 P3 P4       & Runs in parallel with tail of Phase~0 \\
+  2+    & Data renders (background) & P1 + P3           & GPU runs overnight throughout \\
+  2--7  & Implementation            & P1 + P2           & 6 weeks; realistic for beginners \\
+  5--9  & Experiments               & P1 P2 run;        & Start per branch as it passes tests \\
+        &                           & P3 P4 visualise   & \\
+  7--10 & Paper writing             & P4 leads          & Write while experiments run \\
+  11    & Submission                & All               & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{6pt}
+\noindent\textbf{Why 11 weeks instead of 13:}
+\begin{itemize}[leftmargin=1.8em, itemsep=2pt]
+  \item Learning compressed from 2~weeks to 1~week (save 1~week)
+  \item Data renders overlap with implementation instead of following it (save 1~week)
+  \item Paper writing overlaps with experiments instead of following them (save 1~week)
+\end{itemize}
+
+\end{document}
